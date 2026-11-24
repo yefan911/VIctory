@@ -150,6 +150,10 @@ struct Checks {
     keep: Option<Kept>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
+    /// Whether that host runs mesh shaders at all: an adapter without them
+    /// refuses every mesh pipeline with `E_FAIL`, which in the census reads
+    /// as a translator defect unless the refusal says what it is.
+    mesh: bool,
 }
 
 pub fn run(
@@ -209,14 +213,14 @@ pub fn run(
                                 list,
                                 ..Tally::default()
                             };
+                            let host = pipelines.then(|| Host::new(false).ok()).flatten();
                             let mut checks = Checks {
                                 keep: (!pairs.is_empty()).then(|| kept.clone()),
                                 validator: validate
                                     .then(|| Validator::load(dll.as_deref()).ok())
                                     .flatten(),
-                                host: pipelines
-                                    .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
-                                    .flatten(),
+                                mesh: host.as_ref().is_some_and(Host::mesh_shaders),
+                                host: host.map(|h| (h, host::stub_ps())),
                             };
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                                 translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -630,6 +634,10 @@ fn check(
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
+            // An adapter without mesh shaders refuses every one of these with
+            // `Unspecified error`; say that instead, once per program, so the
+            // tally names the host and not the translator.
+            HwStage::Ms if !checks.mesh => Err("the host has no mesh shaders".to_owned()),
             HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
             _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
         };

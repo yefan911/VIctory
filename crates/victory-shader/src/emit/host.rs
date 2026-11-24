@@ -139,6 +139,38 @@ impl Host {
         }
     }
 
+    /// Whether this device runs mesh shaders at shader model 6.6: a translated
+    /// mesh program needs both, and an adapter without them (an integrated
+    /// GPU, anything whose `D3D12_OPTIONS7` mesh tier is not supported)
+    /// refuses every mesh pipeline with `E_FAIL`, which in a census reads
+    /// like a translator defect unless the refusal says what it is.
+    pub fn mesh_shaders(&self) -> bool {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+        let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        // SAFETY: each query writes its own structure of the given size.
+        unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS7,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .is_ok()
+                && self
+                    .device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_SHADER_MODEL,
+                        (&raw mut model).cast(),
+                        size_of_val(&model) as u32,
+                    )
+                    .is_ok()
+                && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
+                && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0
+        }
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.
