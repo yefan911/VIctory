@@ -55,13 +55,14 @@ static LOG_FIRST_CHANCE_BREAKPOINTS: AtomicBool = AtomicBool::new(false);
 /// crash can be read after the console is gone.
 pub fn log_crashes_to(file: std::path::PathBuf) {
     if LOG.set(file).is_ok() {
+        let _ = HOST.set(host());
         let print = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             print(info);
             append_to_log(&format!(
                 "VIctory: panic on thread {:?}: {info}\n{}",
                 std::thread::current().name().unwrap_or("?"),
-                title_output()
+                report_end()
             ));
         }));
     }
@@ -71,7 +72,7 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
 /// log, with the title's last debug output, and prints it.
 pub fn log_crash(text: &str) {
     let text = format!("{text}
-{}", title_output());
+{}", report_end());
     eprint!("{text}");
     append_to_log(&text);
 }
@@ -112,6 +113,57 @@ fn title_output() -> String {
         return String::new();
     };
     said.iter().map(|l| format!("  title said: {l}\n")).collect()
+}
+
+/// The host's line in a crash report. Its CPU and Windows build decide what
+/// title code runs (Intel CPUs lack some of the console's AMD-only
+/// instructions) and which D3D12 runtime there is, so a report needs both.
+/// Set along with the crash log, so a crash queries nothing.
+static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// What ends a crash report: the host, then the title's last debug output.
+fn report_end() -> String {
+    let host = HOST.get().map_or("", String::as_str);
+    format!("{host}{}", title_output())
+}
+
+/// The line [`HOST`] holds.
+fn host() -> String {
+    format!("  host: {}, Windows {}\n", cpu_name(), windows_version())
+}
+
+/// The CPU's brand string, e.g. `AMD Ryzen 7 5700X3D 8-Core Processor`.
+fn cpu_name() -> String {
+    use std::arch::x86_64::__cpuid;
+    if __cpuid(0x8000_0000).eax < 0x8000_0004 {
+        return "an unnamed CPU".into();
+    }
+    let bytes: Vec<u8> = (0x8000_0002..=0x8000_0004)
+        .flat_map(|leaf| {
+            let r = __cpuid(leaf);
+            [r.eax, r.ebx, r.ecx, r.edx]
+        })
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let padding = |c: char| c == '\0' || c.is_whitespace();
+    let name = String::from_utf8_lossy(&bytes);
+    name.trim_matches(padding).to_owned()
+}
+
+/// The running Windows as `major.minor.build`. `RtlGetVersion` gives the
+/// real one; `GetVersionEx` gives what the executable's manifest declares.
+fn windows_version() -> String {
+    use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+    // SAFETY: a zeroed OSVERSIONINFOW is valid; its size field is set.
+    let mut info: OSVERSIONINFOW = unsafe { std::mem::zeroed() };
+    info.dwOSVersionInfoSize = size_of::<OSVERSIONINFOW>() as u32;
+    // SAFETY: fills the structure passed, whose size it was told.
+    if unsafe { RtlGetVersion(&mut info) } != 0 {
+        return "of unknown version".into();
+    }
+    let (major, minor, build) = (info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber);
+    format!("{major}.{minor}.{build}")
 }
 
 /// Installs the handlers; call once before running title code.
@@ -515,9 +567,9 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
     if to_file {
-        let said = title_output();
-        eprint!("{said}");
-        text.push_str(&said);
+        let end = report_end();
+        eprint!("{end}");
+        text.push_str(&end);
         append_to_log(&text);
     }
     #[cfg(feature = "diagnostics")]
@@ -785,6 +837,21 @@ mod tests {
         assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x38])), None); // clflushopt, /7
         assert_eq!(clwb_len(pad(&[0x0f, 0xae, 0x30])), None); // xsaveopt, no 66
         assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0xf0])), None); // register form
+    }
+
+    #[test]
+    fn the_host_line_names_the_cpu_and_windows() {
+        // e.g. "  host: AMD EPYC 7763 64-Core Processor, Windows 10.0.26100\n"
+        let line = host();
+        let framed = line.starts_with("  host: ") && line.ends_with('\n');
+        assert!(framed, "{line:?}");
+        let inner = line.trim_start_matches("  host: ").trim_end();
+        let (cpu, windows) = inner.rsplit_once(", Windows ").expect(&line);
+        let named = !cpu.is_empty() && cpu == cpu.trim() && !cpu.contains('\0');
+        assert!(named, "{line:?}");
+        let version: Vec<u32> = windows.split('.').filter_map(|n| n.parse().ok()).collect();
+        assert!(version.len() == 3 && version[0] >= 10, "{line:?}");
+        println!("{line}");
     }
 
     #[test]
