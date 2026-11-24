@@ -190,10 +190,18 @@ mod device_type {
         text.eq_ignore_ascii_case(expected)
     }
 
-    /// Opens our key for its path; the key has no subkeys. `None`: not
-    /// ours, ask the host.
+    /// Opens our key for its path, or reopens it for a null or empty subkey;
+    /// the key has no subkeys. `None`: not ours, ask the host.
     fn open(root: Key, sub: *const u16, out: *mut Key) -> Option<u32> {
         if root == oem() {
+            if sub.is_null() || is(sub, "") {
+                if out.is_null() {
+                    return Some(INVALID_PARAMETER);
+                }
+                // SAFETY: checked non-null; the title passes room for a key.
+                unsafe { out.write(oem()) };
+                return Some(SUCCESS);
+            }
             return Some(FILE_NOT_FOUND);
         }
         if root == LOCAL_MACHINE && is(sub, KEY) && !out.is_null() {
@@ -368,6 +376,66 @@ mod device_type {
                 SUCCESS
             );
             assert!(size > 0);
+            assert_eq!(RegCloseKey(key), SUCCESS);
+        }
+
+        #[test]
+        fn null_or_empty_subkey_reopens_the_oem_key() {
+            let mut key = std::ptr::null_mut();
+            let path = w(KEY);
+            assert_eq!(RegOpenKeyW(LOCAL_MACHINE, path.as_ptr(), &mut key), SUCCESS);
+            assert_eq!(key, oem());
+
+            let empty = w("");
+            for sub in [std::ptr::null(), empty.as_ptr()] {
+                assert_eq!(
+                    RegOpenKeyW(key, sub, std::ptr::null_mut()),
+                    INVALID_PARAMETER
+                );
+                assert_eq!(
+                    RegOpenKeyExW(key, sub, 0, 1, std::ptr::null_mut()),
+                    INVALID_PARAMETER
+                );
+
+                let mut reopened = std::ptr::null_mut();
+                assert_eq!(RegOpenKeyW(key, sub, &mut reopened), SUCCESS);
+                assert_eq!(reopened, oem());
+                assert_eq!(RegCloseKey(reopened), SUCCESS);
+
+                let mut reopened_ex = std::ptr::null_mut();
+                assert_eq!(RegOpenKeyExW(key, sub, 0, 1, &mut reopened_ex), SUCCESS);
+                assert_eq!(reopened_ex, oem());
+                assert_eq!(RegCloseKey(reopened_ex), SUCCESS);
+            }
+
+            let child = w("SubKey");
+            let mut sub_out = std::ptr::null_mut();
+            assert_eq!(
+                RegOpenKeyW(key, child.as_ptr(), &mut sub_out),
+                FILE_NOT_FOUND
+            );
+            assert_eq!(
+                RegOpenKeyExW(key, child.as_ptr(), 0, 1, &mut sub_out),
+                FILE_NOT_FOUND
+            );
+
+            let (mut kind, mut value, mut size) = (0, 0u32, 4);
+            let name = w(VALUE);
+            assert_eq!(
+                RegQueryValueExW(
+                    key,
+                    name.as_ptr(),
+                    std::ptr::null_mut(),
+                    &mut kind,
+                    (&raw mut value).cast(),
+                    &mut size,
+                ),
+                SUCCESS
+            );
+            assert_eq!(
+                (kind, size, value),
+                (DWORD, 4, console_mode(console::current()))
+            );
             assert_eq!(RegCloseKey(key), SUCCESS);
         }
     }
