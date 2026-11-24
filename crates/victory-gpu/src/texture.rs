@@ -70,6 +70,25 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
+// Track upload allocations without extending their lifetime after a texture is released.
+#[cfg(feature = "diagnostics")]
+static LIVE_STAGING: Mutex<Vec<std::sync::Weak<Staging>>> = Mutex::new(Vec::new());
+
+/// Live upload buffer sizes and retained CPU read capacities, in bytes.
+/// Omit a busy sample instead of waiting on texture work for diagnostics.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn cached_staging_bytes() -> Option<(u64, usize)> {
+    let staging = LIVE_STAGING.try_lock().ok()?;
+    let mut upload = 0;
+    let mut read = 0;
+    for allocation in staging.iter().filter_map(std::sync::Weak::upgrade) {
+        let last = allocation.last.try_lock().ok()?;
+        upload += allocation.size;
+        read += last.read.capacity();
+    }
+    Some((upload, read))
+}
+
 /// A host copy or resolve writes `resource`: its host texture's contents
 /// are the host's, not title memory's, which stays as it was.
 pub(crate) fn host_written(resource: This) {
@@ -476,6 +495,14 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         tracked: crate::watch::track(memory as usize, layout_size, true),
         last: Mutex::default(),
     });
+    #[cfg(feature = "diagnostics")]
+    {
+        let mut staging = LIVE_STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        if staging.len().is_power_of_two() {
+            staging.retain(|allocation| allocation.strong_count() != 0);
+        }
+        staging.push(Arc::downgrade(&s));
+    }
     *held = Some(s.clone());
     Some(s)
 }

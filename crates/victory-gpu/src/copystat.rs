@@ -277,6 +277,19 @@ pub(crate) fn log(frames: f64) {
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },
     );
+    let snapshots = crate::shadow::idle_snapshot_bytes();
+    let textures = crate::texture::cached_staging_bytes();
+    if let (Some(idle_snapshot_bytes), Some((texture_upload_bytes, texture_read_capacity_bytes))) =
+        (snapshots, textures)
+    {
+        tracing::info!(
+            idle_snapshot_bytes,
+            texture_upload_bytes,
+            texture_read_capacity_bytes,
+            "retained copy memory"
+        );
+    }
+
     let held: Vec<String> = crate::watch::held_times()
         .iter()
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))
