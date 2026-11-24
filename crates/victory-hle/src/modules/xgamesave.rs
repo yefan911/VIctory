@@ -199,7 +199,11 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     }
     let version = dir.join(format!("v{number}"));
     let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
-    let mut names = parse_manifest(&std::fs::read(version.join(MANIFEST))?).ok_or_else(bad)?;
+    // The version directory exists, so a missing or unreadable manifest is a
+    // malformed committed container, not an absent one. Callers distinguish
+    // NotFound (no container yet) from this case.
+    let manifest = std::fs::read(version.join(MANIFEST)).map_err(|_| bad())?;
+    let mut names = parse_manifest(&manifest).ok_or_else(bad)?;
     let blobs = names.split_off(2);
     let [name, display] = <[String; 2]>::try_from(names).map_err(|_| bad())?;
     Ok(Some(Version {
@@ -1014,6 +1018,34 @@ mod tests {
 
     fn old_state() -> Option<(String, Vec<(String, String)>)> {
         Some(("one".into(), vec![("a".into(), "old a".into()), ("b".into(), "old b".into())]))
+    }
+
+    #[test]
+    fn a_committed_container_without_its_manifest_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(update(dir.path(), "one", &[("a", Some("old a"))]), S_OK);
+        assert_eq!(update(dir.path(), "two", &[("b", Some("new b"))]), S_OK);
+        let container = container_dir(dir.path(), "Slot");
+        let newest = current(&container).unwrap().unwrap();
+        assert_eq!(newest.number, 2);
+        std::fs::remove_file(newest.dir.join(MANIFEST)).unwrap();
+        assert_eq!(
+            update(dir.path(), "three", &[("c", Some("new c"))]),
+            NO_ACCESS,
+            "a malformed committed container is not an empty one"
+        );
+        let versions: Vec<_> = std::fs::read_dir(&container)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .strip_prefix('v')
+                    .is_some_and(|n| n.parse::<u64>().is_ok())
+            })
+            .collect();
+        assert_eq!(versions.len(), 1, "no new version was committed");
     }
 
     /// Run by the crash test in a child process; does nothing otherwise.
