@@ -172,6 +172,12 @@ impl Tables {
         let mut ctrl7 = [0u16; 512];
         for c in &mut ctrl7 {
             *c = r.u16();
+            let mode = usize::from(*c & 7);
+            let subsets = usize::from((*c & 0xff) >> 6);
+            const BC7_SUBSETS: [usize; 8] = [3, 2, 3, 2, 1, 1, 1, 2];
+            if *c != 0 && subsets != BC7_SUBSETS[mode] {
+                return Err(Error("a BC7 control word has the wrong subset count"));
+            }
         }
         let mut plain = |ep: usize, ix: usize| {
             (0..DICTIONARY)
@@ -1339,6 +1345,37 @@ mod tests {
         w.put(1, 1);
         w.put(1, 1);
         assert_eq!(dst, w.v.to_le_bytes());
+    }
+
+    #[test]
+    fn bc7_control_subset_counts_match_each_mode_and_zero_sentinel() {
+        const EXPECTED_SUBSETS: [u16; 8] = [3, 2, 3, 2, 1, 1, 1, 2];
+        let ctrl7_offset = MODELS * BUCKETS * 2 + 256 + 64 + 256 + 64 + 64;
+
+        // Synthetic dictionary tables use zero controls as the valid sentinel.
+        assert!(Tables::parse(&tables()).is_ok());
+
+        for (mode, &expected) in EXPECTED_SUBSETS.iter().enumerate() {
+            for subsets in 0..=3u16 {
+                let mut bytes = tables();
+                let control = (subsets << 6) | mode as u16;
+                bytes[ctrl7_offset..ctrl7_offset + 2].copy_from_slice(&control.to_le_bytes());
+                let result = Tables::parse(&bytes);
+                if control == 0 || subsets == expected {
+                    assert!(
+                        result.is_ok(),
+                        "mode {mode} should accept {subsets} subsets (or zero sentinel)"
+                    );
+                } else {
+                    assert!(
+                        result.is_err_and(
+                            |error| error.0 == "a BC7 control word has the wrong subset count"
+                        ),
+                        "mode {mode} should reject {subsets} subsets"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
