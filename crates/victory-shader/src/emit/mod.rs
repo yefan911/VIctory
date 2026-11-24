@@ -178,6 +178,8 @@ mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+#[cfg(all(test, windows))]
+mod permlane_tests;
 mod rect;
 pub use rect::rectangle_gs;
 #[cfg(all(test, windows))]
