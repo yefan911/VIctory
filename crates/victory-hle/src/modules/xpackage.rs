@@ -196,6 +196,15 @@ extern "system" fn register_progress(
     put(out, token())
 }
 
+extern "system" fn unregister_progress(
+    _: This,
+    _monitor: *const c_void,
+    _token: u64,
+    _wait: bool,
+) -> bool {
+    true
+}
+
 /// 0: ready.
 // shortcut: every well-formed selector counts as installed, including ones
 // the package's layout does not have; Grand Theft Auto VI asks only about
@@ -359,7 +368,7 @@ static VTABLE: Methods<40> = Methods([
     progress as *const (),              // 0x38
     missing::<8> as *const (),          // 0x40 update a monitor
     register_progress as *const (),     // 0x48
-    missing::<10> as *const (),         // 0x50 unregister it
+    unregister_progress as *const (),   // 0x50 unregister it
     missing::<11> as *const (),         // 0x58 user locale
     find_availability as *const (),     // 0x60
     missing::<13> as *const (),         // 0x68 enumerate chunk availability
@@ -587,6 +596,35 @@ mod tests {
         };
         method::<Progress_>(&OBJECT, 0x38)(this, monitor(), &mut p);
         assert!(p.completed && p.launchable && p.installed_bytes == p.total_bytes);
+
+        type RegisterProgress = extern "system" fn(
+            This,
+            *const c_void,
+            *mut c_void,
+            *const c_void,
+            *mut u64,
+        ) -> HRESULT;
+        let mut token_val = 0u64;
+        assert_eq!(
+            method::<RegisterProgress>(&OBJECT, 0x48)(
+                this,
+                monitor(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &mut token_val,
+            ),
+            S_OK
+        );
+        assert_ne!(token_val, 0);
+
+        type UnregisterProgress =
+            extern "system" fn(This, *const c_void, u64, bool) -> bool;
+        assert!(method::<UnregisterProgress>(&OBJECT, 0x50)(
+            this,
+            monitor(),
+            token_val,
+            true,
+        ));
 
         type Mount = extern "system" fn(This, *const c_char, *mut AsyncBlock) -> HRESULT;
         let mut block = AsyncBlock {
