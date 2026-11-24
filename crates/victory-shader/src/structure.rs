@@ -146,6 +146,9 @@ const TERMINAL: u32 = u32::MAX;
 const MAX_NODES: usize = 1 << 21;
 /// Case splits [`Bools::meet`] makes before it gives up.
 const MAX_MEET: usize = 1 << 16;
+/// Cap the `ite` memo table so complex shaders cannot trigger multi-tens-of-MB
+/// HashMap resizes (e.g. 35 MB at 2^21 buckets) under concurrent compilation.
+const MAX_MEMO: usize = 1 << 18;
 
 impl Bools {
     fn new() -> Self {
@@ -232,6 +235,9 @@ impl Bools {
     }
 
     fn ite(&mut self, f: Bool, g: Bool, h: Bool) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
         if f == Bool::TRUE || g == h {
             return g;
         }
@@ -250,7 +256,12 @@ impl Bools {
         let lo = self.ite(f0, g0, h0);
         let hi = self.ite(f1, g1, h1);
         let r = self.mk(v, lo, hi);
-        self.memo.insert((f, g, h), r);
+        if !self.overflow {
+            if self.memo.len() >= MAX_MEMO {
+                self.memo.clear();
+            }
+            self.memo.insert((f, g, h), r);
+        }
         r
     }
 
@@ -341,6 +352,9 @@ impl Bools {
     /// `b` with every atom born at reverse-postorder index `from` or later
     /// existentially quantified: what still holds once those are redefined.
     fn forget(&mut self, b: Bool, from: usize, memo: &mut Map<Bool, Bool>) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
         let (v, lo, hi) = self.nodes[b.0 as usize];
         if v == TERMINAL {
             return b;
