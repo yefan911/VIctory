@@ -192,6 +192,7 @@ struct Lower<'a> {
     root_views: HashMap<u32, V>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
+    atomic_descriptor_loads: HashSet<Site>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
@@ -446,6 +447,61 @@ fn half_outputs(io: &StageIo) -> HashMap<u8, bool> {
         .collect()
 }
 
+/// Loads whose eight SGPRs are used only as one image atomic's resource.
+/// The atomic rebuilds the heap index from the load address.
+fn atomic_descriptor_loads(p: &Program, res: &Resources) -> HashSet<Site> {
+    let mut loads = HashSet::new();
+    let mut readers = HashMap::new();
+    for d in &res.descriptors {
+        let Source::Loaded { load, first: 0 } = d.source else {
+            continue;
+        };
+        let atomic = &p.blocks[d.site.0].insts[d.site.1];
+        let Fields::Image {
+            rsrc: Operand::Scalar { code, dwords: 8 },
+            ..
+        } = atomic.fields
+        else {
+            continue;
+        };
+        let inst = &p.blocks[load.0].insts[load.1];
+        if !atomic.name().starts_with("image_atomic_")
+            || inst.name() != "s_load_dwordx8"
+            || code > crate::ir::VCC - 8
+            || inst.writes.len() != 8
+        {
+            continue;
+        }
+        if inst.writes.iter().all(|&(reg, v)| {
+            matches!(reg, Reg::S(n) if (code..code + 8).contains(&n)) && atomic.read(reg) == Some(v)
+        }) {
+            loads.insert(load);
+            for &(_, v) in &inst.writes {
+                readers.insert(v, (load, d.site));
+            }
+        }
+    }
+    if !loads.is_empty() {
+        for (b, block) in p.blocks.iter().enumerate() {
+            for v in block.phis.iter().flat_map(|phi| &phi.args) {
+                if let Some((load, _)) = readers.get(v) {
+                    loads.remove(load);
+                }
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                for (_, v) in &inst.reads {
+                    if let Some(&(load, reader)) = readers.get(v)
+                        && reader != (b, i)
+                    {
+                        loads.remove(&load);
+                    }
+                }
+            }
+        }
+    }
+    loads
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -593,6 +649,7 @@ impl<'a> Lower<'a> {
             user_reads: BTreeMap::new(),
             root_views: HashMap::new(),
             samplers: Vec::new(),
+            atomic_descriptor_loads: atomic_descriptor_loads(p, x.res),
             descriptors: x
                 .res
                 .descriptors
@@ -3936,6 +3993,9 @@ impl<'a> Lower<'a> {
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
+        if self.atomic_descriptor_loads.contains(&site) {
+            return Ok(());
+        }
         const OTHER: Why = "a descriptor's address or format read as data";
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),

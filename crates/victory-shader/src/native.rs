@@ -979,6 +979,71 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn reconstructs_an_atomic_descriptor_only_when_its_words_are_read() {
+        const X8: u32 = 0xf40c_0200; // s_load_dwordx8 s[8:15], s[0:1], 0
+        const X16: u32 = 0xf410_0200;
+        const UMAX: [u32; 2] = [0xf05c_0108, 0x0002_0200]; // image_atomic_umax v2, v[0:1], s[8:15]
+        const FIELD: u32 = 0x7e04_020a; // v_mov_b32 v2, s10 (descriptor dword 2)
+        // The second half of an x16 load is unused. Its first eight words
+        // describe the same view and still take the reconstruction path.
+        let translate = |load, data: u32, after: &[u32]| {
+            let mut words = vec![
+                0xbe81_0380, // s_mov_b32 s1, 0 (table address high)
+                load,
+                0xfa00_0000,
+                0x7e00_0280,
+                0x7e02_0280, // v0, v1 = (0, 0)
+                data,
+            ];
+            words.extend(UMAX);
+            words.extend_from_slice(after);
+            words.push(0xbf81_0000); // s_endpgm
+            let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let mut blob = fssm(&[(HwStage::Cs, &code)]);
+            let stage = stage_data_at(&blob, HwStage::Cs);
+            blob[stage + CS_RSRC2..][..4].copy_from_slice(&2u32.to_le_bytes());
+            for k in 0..3 {
+                blob[stage + CS_THREADS + 4 * k..][..4].copy_from_slice(&1u32.to_le_bytes());
+            }
+            let record = stage - RECORD_SIZE as usize;
+            let table = (blob.len() - FSSM_HEADER) as u64;
+            // A root table in s0, slot 0.
+            for v in [3u32, 0, 1, 0, 0] {
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
+            blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&table.to_le_bytes());
+            blob[record + RECORD_COUNTS..][..4].copy_from_slice(&1u32.to_le_bytes());
+            let size = (blob.len() - FSSM_HEADER) as u64;
+            blob[8..16].copy_from_slice(&size.to_le_bytes());
+            let native = part(&[(KIND_NATIVE, &xbch(&blob))]);
+            let container = crate::dxbc::build(&[(crate::dxbc::FourCC::DXIL, &native)]);
+            let shader = crate::emit::translate(&container).unwrap();
+            #[cfg(windows)]
+            if let Ok(mut v) = crate::emit::validator::Validator::load(
+                crate::emit::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut shader.dxil.clone()).unwrap();
+            }
+            shader.dxil
+        };
+        const ONE: u32 = 0x7e04_0281; // v_mov_b32 v2, 1
+        assert!(translate(X8, ONE, &[]).len() < translate(X16, ONE, &[]).len());
+        assert_eq!(translate(X8, FIELD, &[]), translate(X16, FIELD, &[]));
+        assert_eq!(translate(X8, ONE, &UMAX), translate(X16, ONE, &UMAX));
+        let joined = [
+            0xbf06_8000, // s_cmp_eq_u32 s0, 0
+            0xbf84_0001, // s_cbranch_scc0 over replacement of dword 2
+            0xbe8a_0387, // s_mov_b32 s10, 7
+            FIELD,
+            X8,
+            0xfa00_0000,
+            UMAX[0],
+            UMAX[1],
+        ];
+        assert_eq!(translate(X8, ONE, &joined), translate(X16, ONE, &joined));
+    }
+
+    #[test]
     fn reads_pixel_io_and_applies_the_full_export_patch() {
         let code = [0xBF80_0000u32; 4]; // s_nop
         let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
