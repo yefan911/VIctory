@@ -475,6 +475,18 @@ mod tests {
         );
     }
 
+    /// RDNA2 (GFX10.3) has the fused legacy multiply-adds at these
+    /// opcodes: LLVM's gfx1030 assembler tests encode
+    /// `v_fma_legacy_f32 v0, v1, v2, v3` and `v_fmac_legacy_f32_e32 v0,
+    /// v1, v2` as these words.
+    #[test]
+    fn legacy_multiply_adds_are_the_fused_ones() {
+        let fma = summary(&[0xD540_0000, 0x040E_0501, S_ENDPGM]);
+        assert_eq!(fma[0].2, "v_fma_legacy_f32");
+        let fmac = summary(&[0x0C00_0501, S_ENDPGM]);
+        assert_eq!(fmac[0].2, "v_fmac_legacy_f32");
+    }
+
     #[test]
     fn rejects_bad_code() {
         assert!(decode(&[0; 3]).is_err(), "size not a multiple of 4");

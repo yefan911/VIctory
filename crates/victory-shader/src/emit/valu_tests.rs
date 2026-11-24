@@ -509,6 +509,24 @@ fn v_cmp_lg_is_false_for_nan() {
 }
 
 #[test]
+fn v_fma_legacy_f32_follows_the_d3d9_zero_rule() {
+    // v_fma_legacy_f32 v0, v1, v2, v3 (VOP3 opcode 0x140 on RDNA2)
+    let shader = build_valu_cs(&vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let f = f32::to_bits;
+    let cases: &[([u32; 4], u32)] = &[
+        ([f(2.0), f(3.0), f(1.0), 0], f(7.0)),
+        // A zero factor gives a zero product, whatever the other one is.
+        ([0, f(f32::INFINITY), f(1.5), 0], f(1.5)),
+        ([f(f32::NAN), 0, f(-2.0), 0], f(-2.0)),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let want = cases[i].1;
+        assert_eq!(got, want, "{backend}: case {i}: {got:#x}, want {want:#x}");
+    });
+}
+
+#[test]
 fn v_fract_f32_never_returns_one() {
     // v_fract_f32 v0, v1 (VOP1 opcode 0x020)
     let shader = build_valu_cs(&[vop1(0x020, 0, vgpr(1))]);

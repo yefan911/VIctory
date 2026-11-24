@@ -332,7 +332,9 @@ pub(super) const VOP2: &[(u16, &str)] = &[
     (0x003, "v_add_f32"),
     (0x004, "v_sub_f32"),
     (0x005, "v_subrev_f32"),
-    (0x006, "v_mac_legacy_f32"),
+    // GFX10.3 fuses the legacy multiply-adds of GFX10.1 (Mesa's GFX10
+    // column has the older names): AMD's RDNA2 ISA, LLVM's gfx1030 tables.
+    (0x006, "v_fmac_legacy_f32"),
     (0x007, "v_mul_legacy_f32"),
     (0x008, "v_mul_f32"),
     (0x009, "v_mul_i32_i24"),
@@ -657,7 +659,7 @@ pub(super) const VOPC: &[(u16, &str)] = &[
 ];
 
 pub(super) const VOP3: &[(u16, &str)] = &[
-    (0x140, "v_mad_legacy_f32"),
+    (0x140, "v_fma_legacy_f32"),
     (0x141, "v_mad_f32"),
     (0x142, "v_mad_i32_i24"),
     (0x143, "v_mad_u32_u24"),
