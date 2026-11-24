@@ -858,6 +858,19 @@ mod tests {
             v.validate(&mut vs.dxil.clone()).unwrap();
         }
         host.pipeline(&vs, &ps).unwrap();
+        // vkd3d-proton does not enforce the DXIL container checksum. The
+        // successful pipeline above is still exercised under Wine.
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: both names are NUL terminated, and the module is checked
+        // before looking up its export. The export is never called.
+        let under_wine = unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        };
+        if under_wine {
+            eprintln!("pipeline created under Wine. Skipping native D3D12 checksum checks.");
+            return;
+        }
         // The runtime checks the container hash: no hash or a wrong one is
         // refused. (Recent runtimes also take sixteen 0x01 bytes, a bypass
         // value; ours works with older ones too.)
