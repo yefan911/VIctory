@@ -236,10 +236,16 @@ pub fn build_bounded(
             blocks[b].exit = match flow {
                 Flow::Next => Exit::Jump(fallthrough()?),
                 Flow::Jump(t) => Exit::Jump(block_at(t)?),
-                Flow::Branch(t) => Exit::Branch {
-                    taken: block_at(t)?,
-                    not_taken: fallthrough()?,
-                },
+                Flow::Branch(t) => {
+                    let taken = block_at(t)?;
+                    let not_taken = fallthrough()?;
+                    // The same successor needs only one incoming SSA edge.
+                    if taken == not_taken {
+                        Exit::Jump(taken)
+                    } else {
+                        Exit::Branch { taken, not_taken }
+                    }
+                }
                 Flow::Stop if name == "s_setpc_b64" => Exit::Indirect,
                 Flow::Stop => Exit::End,
             };
@@ -1316,6 +1322,37 @@ mod tests {
             assert_eq!(mov1.read(Reg::S(EXEC + 1)).is_some(), wave64);
             assert_eq!((end.name(), b2.exit), ("s_endpgm", Exit::End));
         }
+    }
+
+    #[test]
+    fn a_conditional_branch_to_its_fallthrough_has_one_edge() {
+        let p = build_words(
+            &[
+                0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                0xBF85_0002, // s_cbranch_scc1 -> 16
+                0xBE82_0380, // s_mov_b32 s2, 0
+                0xBF82_0001, // s_branch -> 20
+                0xBF85_0000, // 16: both arms go to 20
+                0x7E00_0202, // 20: v_mov_b32 v0, s2
+                S_ENDPGM,
+            ],
+            true,
+        );
+        assert_eq!(p.blocks[2].exit, Exit::Jump(3));
+        let join = &p.blocks[3];
+        assert_eq!(join.preds, [1, 2]);
+        let [phi] = &join.phis[..] else {
+            panic!("expected one live phi, got {:?}", join.phis);
+        };
+        assert_eq!(phi.reg, Reg::S(2));
+        assert_eq!(
+            phi.args,
+            [
+                p.blocks[1].insts[0].write(Reg::S(2)).unwrap(),
+                input(&p, Reg::S(2)),
+            ],
+        );
+        assert_eq!(join.insts[0].read(Reg::S(2)), Some(phi.value));
     }
 
     #[test]
