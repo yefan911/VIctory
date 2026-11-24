@@ -53,27 +53,15 @@ pub(crate) struct HostHeap {
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
 }
 
-/// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
-/// device-removed reports: a shader indexing a heap past its end faults.
+/// Recorded GPU handle ranges (start, length, increment, sampler) for
+/// device-removed reports. A range can outlive its heap.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
 
 /// For device-removed reports: where host GPU address `va` lies against
 /// the host descriptor heaps.
 pub(crate) fn near_heaps(va: u64) -> String {
     let ranges = GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner());
-    let mut text = String::new();
-    for &(start, bytes, step, sampler) in ranges.iter() {
-        let kind = if sampler { "sampler" } else { "view" };
-        let place = if va < start {
-            format!("{:#x} below", start - va)
-        } else if va < start + bytes {
-            format!("inside, slot {}", (va - start) / step)
-        } else {
-            format!("{:#x} past its end (slot {})", va - start - bytes, (va - start) / step)
-        };
-        text.push_str(&format!("; {kind} heap {start:#x}+{bytes:#x}: {place}"));
-    }
-    text
+    super::describe_heap_ranges(va, &ranges)
 }
 
 /// The host's limit for shader-visible view heaps on resource binding
