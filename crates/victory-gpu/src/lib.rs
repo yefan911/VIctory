@@ -25,6 +25,8 @@ pub mod console;
 mod copystat;
 pub mod descriptor;
 pub mod device;
+#[cfg(all(test, windows))]
+mod dirty_pages_test;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
