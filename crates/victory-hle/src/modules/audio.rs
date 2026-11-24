@@ -19,6 +19,7 @@
 use std::alloc::Layout;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 use std::time::Instant;
 
@@ -384,15 +385,18 @@ fn xma() -> RwLockReadGuard<'static, Xma> {
 struct Context(*mut u32);
 
 impl Context {
+    fn word(&self, word: usize) -> &AtomicU32 {
+        // SAFETY: inside the 64-byte aligned context array; the title reads
+        // and writes these words concurrently, like the hardware's.
+        unsafe { AtomicU32::from_ptr(self.0.add(word)) }
+    }
+
     fn get(self, word: usize) -> u32 {
-        // SAFETY: inside the context array; the title reads and writes it
-        // concurrently, like the hardware's.
-        unsafe { self.0.add(word).read_volatile() }
+        self.word(word).load(Ordering::Acquire)
     }
 
     fn set(self, word: usize, value: u32) {
-        // SAFETY: as above.
-        unsafe { self.0.add(word).write_volatile(value) }
+        self.word(word).store(value, Ordering::Release);
     }
 
     fn field(self, word: usize, shift: u32, bits: u32) -> u32 {
@@ -401,7 +405,12 @@ impl Context {
 
     fn set_field(self, word: usize, shift: u32, bits: u32, value: u32) {
         let mask = ((1u32 << bits) - 1) << shift;
-        self.set(word, (self.get(word) & !mask) | ((value << shift) & mask));
+        let bits = (value << shift) & mask;
+        let _ = self
+            .word(word)
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                Some((old & !mask) | bits)
+            });
     }
 
     fn channels(self) -> usize {
@@ -1421,5 +1430,29 @@ mod tests {
         assert_eq!((m.message_count)(acp), 1, "disconnected");
         (m.release)(acp);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    #[test]
+    fn context_set_field_does_not_clobber_concurrent_bitfields() {
+        let words: [AtomicU32; 16] = std::array::from_fn(|_| AtomicU32::new(0));
+        let raw = words[0].as_ptr() as usize;
+        std::thread::scope(|s| {
+            // Decoder side: repeatedly updates word 0's write-block field (bits 27..31).
+            s.spawn(move || {
+                let ctx = Context(raw as *mut u32);
+                for i in 0..50_000u32 {
+                    ctx.set_field(0, 27, 5, i & 31);
+                }
+            });
+            // Title side: concurrently updates word 0's valid-input bits (bits 20..21).
+            const MASK: u32 = 3 << 20;
+            for i in 0..50_000u32 {
+                let expected = (i & 3) << 20;
+                let _ = words[0].fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                    Some((old & !MASK) | expected)
+                });
+                assert_eq!(words[0].load(Ordering::Acquire) & MASK, expected);
+            }
+        });
     }
 }
