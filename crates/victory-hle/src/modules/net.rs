@@ -135,10 +135,40 @@ fn loopback(ip: IpAddr) -> bool {
     ip.to_canonical().is_loopback()
 }
 
-/// `localhost` or a loopback literal (bracketed IPv6 too).
+/// The local host name query via `gethostname` from host `ws2_32.dll`.
+fn local_hostname() -> Option<String> {
+    static HOSTNAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HOSTNAME
+        .get_or_init(|| {
+            let mut buf = [0 as c_char; 256];
+            let rc = host!("ws2_32.dll", "gethostname": extern "system" fn(*mut c_char, i32) -> i32)(
+                buf.as_mut_ptr(),
+                buf.len() as i32,
+            );
+            if rc == 0 {
+                // SAFETY: NUL-terminated by successful gethostname.
+                let s = unsafe { CStr::from_ptr(buf.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned();
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+            None
+        })
+        .clone()
+}
+
+fn is_local_hostname(name: &str) -> bool {
+    local_hostname().is_some_and(|host| host.eq_ignore_ascii_case(name))
+}
+
+/// `localhost`, the local hostname, or a loopback literal (bracketed IPv6 too).
 fn loopback_name(name: &str) -> bool {
     let bare = name.trim_start_matches('[').trim_end_matches(']');
-    bare.eq_ignore_ascii_case("localhost") || bare.parse().is_ok_and(loopback)
+    bare.eq_ignore_ascii_case("localhost")
+        || is_local_hostname(bare)
+        || bare.parse().is_ok_and(loopback)
 }
 
 fn shown(addr: Option<impl ToString>) -> String {
@@ -177,13 +207,14 @@ fn reachable_name(name: Option<String>) -> bool {
     }
 }
 
-/// Names answered without asking the network: none, `localhost`, IP
-/// literals (connecting to one is vetted separately).
+/// Names answered without asking the network: none, `localhost`, local hostname,
+/// IP literals (connecting to one is vetted separately).
 fn resolvable(name: Option<String>) -> bool {
     match name {
         Some(name)
             if !(name.is_empty()
                 || name.eq_ignore_ascii_case("localhost")
+                || is_local_hostname(&name)
                 || name.parse::<IpAddr>().is_ok()) =>
         {
             once("network name lookup blocked", name);
@@ -1152,6 +1183,22 @@ mod tests {
             ),
             WSAHOST_NOT_FOUND
         );
+
+        // Local machine hostname is resolvable.
+        if let Some(host) = local_hostname() {
+            let mut host_result = null;
+            let host_c = std::ffi::CString::new(host.clone()).unwrap();
+            let rc = getaddrinfo(
+                host_c.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut host_result,
+            );
+            assert_eq!(rc, 0, "local hostname {host} must be resolvable");
+            if !host_result.is_null() {
+                host!("ws2_32.dll", "freeaddrinfo": extern "system" fn(*mut c_void))(host_result);
+            }
+        }
         let mut text = [0 as c_char; 64];
         let away = v4(AWAY, 80);
         assert_eq!(
