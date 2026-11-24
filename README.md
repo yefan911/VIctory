@@ -1,5 +1,7 @@
 # VIctory
 
+*Read this in: [English](README.md) | [Bahasa Indonesia](languages/README.id.md)*
+
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
 the user supplies.
 
