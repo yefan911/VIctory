@@ -79,6 +79,21 @@ pub enum Exit {
 }
 
 impl Exit {
+    fn successor_at(&self, index: usize) -> Option<usize> {
+        match (*self, index) {
+            (Exit::Jump(b), 0)
+            | (Exit::Branch { taken: b, .. }, 0) => Some(b),
+            (Exit::Branch { not_taken, .. }, 1) => Some(not_taken),
+            _ => None,
+        }
+    }
+
+    fn successor_iter(&self) -> impl Iterator<Item = usize> {
+        self.successor_at(0)
+            .into_iter()
+            .chain(self.successor_at(1))
+    }
+
     pub fn successors(&self) -> Vec<usize> {
         match *self {
             Exit::Jump(b) => vec![b],
@@ -352,8 +367,8 @@ pub(crate) fn reverse_postorder(blocks: &[Block]) -> Vec<usize> {
     while let Some(top) = stack.last_mut() {
         let (b, i) = *top;
         top.1 += 1;
-        match blocks[b].exit.successors().get(i) {
-            Some(&s) if !seen[s] => {
+        match blocks[b].exit.successor_at(i) {
+            Some(s) if !seen[s] => {
                 seen[s] = true;
                 stack.push((s, 0));
             }
@@ -374,7 +389,7 @@ fn link(blocks: &mut [Block]) {
         block.preds.clear();
     }
     for b in 0..blocks.len() {
-        for s in blocks[b].exit.successors() {
+        for s in blocks[b].exit.successor_iter() {
             blocks[s].preds.push(b);
         }
     }
@@ -391,7 +406,7 @@ pub(crate) fn irreducible_edge(
     let &entry = order.first()?;
     let idom = idoms(blocks, order, index);
     for &b in order {
-        for s in blocks[b].exit.successors() {
+        for s in blocks[b].exit.successor_iter() {
             if index[s] > index[b] {
                 continue;
             }
@@ -485,7 +500,7 @@ fn split_irreducible(blocks: &mut Vec<Block>) -> Result<(), ShaderError> {
             }
             copy[b] = blocks.len() + copied.len();
             copied.push(b);
-            for s in blocks[b].exit.successors() {
+            for s in blocks[b].exit.successor_iter() {
                 if region[s] && s != header {
                     stack.push(s);
                 }
@@ -529,16 +544,16 @@ fn multi_entry_loop(blocks: &[Block], inside: &[bool]) -> Option<(Vec<bool>, Vec
         let mut seen = vec![false; blocks.len()];
         let mut stack = vec![from];
         while let Some(b) = stack.pop() {
-            let next = if forward {
-                blocks[b].exit.successors()
-            } else {
-                blocks[b].preds.clone()
-            };
-            for n in next {
+            let mut visit = |n: usize| {
                 if inside[n] && !seen[n] {
                     seen[n] = true;
                     stack.push(n);
                 }
+            };
+            if forward {
+                blocks[b].exit.successor_iter().for_each(&mut visit);
+            } else {
+                blocks[b].preds.iter().copied().for_each(&mut visit);
             }
         }
         seen
@@ -600,7 +615,7 @@ fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
         changed = false;
         for &b in order.iter().rev() {
             let mut out = empty;
-            for s in blocks[b].exit.successors() {
+            for s in blocks[b].exit.successor_iter() {
                 for (o, i) in out.iter_mut().zip(&live_in[s]) {
                     *o |= i;
                 }
@@ -1063,6 +1078,176 @@ fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<Reg>) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reference_postorder(blocks: &[Block]) -> Vec<usize> {
+        let mut seen = vec![false; blocks.len()];
+        let mut post = Vec::with_capacity(blocks.len());
+        let mut stack = vec![(0, 0)];
+        seen[0] = true;
+        while let Some(top) = stack.last_mut() {
+            let (b, i) = *top;
+            top.1 += 1;
+            match blocks[b].exit.successors().get(i) {
+                Some(&s) if !seen[s] => {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        post
+    }
+
+
+    #[test]
+    fn cfg_successors_preserve_order() {
+        for exit in [
+            Exit::End,
+            Exit::Indirect,
+            Exit::Jump(3),
+            Exit::Branch {
+                taken: 7,
+                not_taken: 2,
+            },
+            Exit::Branch {
+                taken: 4,
+                not_taken: 4,
+            },
+        ] {
+            assert_eq!(
+                exit.successor_iter().collect::<Vec<_>>(),
+                exit.successors()
+            );
+        }
+    }
+
+    fn synthetic_cfg(diamonds: usize) -> Vec<Block> {
+        let block = |exit| Block {
+            offset: 0,
+            preds: Vec::new(),
+            phis: Vec::new(),
+            insts: Vec::new(),
+            exit,
+        };
+
+        let mut blocks = Vec::new();
+
+        for i in 0..diamonds {
+            let base = i * 3;
+
+            blocks.push(block(Exit::Branch {
+                taken: base + 1,
+                not_taken: base + 2,
+            }));
+
+            blocks.push(block(Exit::Jump(base + 3)));
+
+            let exit = if i % 5 == 0 {
+                Exit::Branch {
+                    taken: base,
+                    not_taken: base + 3,
+                }
+            } else {
+                Exit::Jump(base + 3)
+            };
+
+            blocks.push(block(exit));
+        }
+
+        blocks.push(block(Exit::End));
+
+        // Unreachable block.
+        blocks.push(block(Exit::Jump(diamonds * 3 + 1)));
+
+        blocks
+    }
+
+    #[test]
+    fn cfg_postorder_matches_reference() {
+        for count in [0, 1, 2, 16, 128, 2048] {
+            let blocks = synthetic_cfg(count);
+
+            let expected = reference_postorder(&blocks);
+            let actual = reverse_postorder(&blocks);
+
+            assert_eq!(actual, expected);
+            assert_eq!(actual.len(), count * 3 + 1);
+        }
+    }
+
+    #[test]
+    #[ignore = "synthetic release microbenchmark"]
+    fn cfg_postorder_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn measure(
+            blocks: &[Block],
+            run: impl Fn(&[Block]) -> Vec<usize>,
+        ) -> f64 {
+            let start = Instant::now();
+
+            for _ in 0..128 {
+                black_box(run(black_box(blocks)));
+            }
+
+            start.elapsed().as_secs_f64() * 1000.0
+        }
+
+        for count in [256, 2048, 8192] {
+            let blocks = synthetic_cfg(count);
+
+            assert_eq!(
+                reference_postorder(&blocks),
+                reverse_postorder(&blocks)
+            );
+
+            black_box(measure(&blocks, reference_postorder));
+            black_box(measure(&blocks, reverse_postorder));
+
+            let mut original = Vec::new();
+            let mut candidate = Vec::new();
+
+            for round in 0..5 {
+                let (a, b) = if round % 2 == 0 {
+                    let a = measure(&blocks, reference_postorder);
+                    let b = measure(&blocks, reverse_postorder);
+                    (a, b)
+                } else {
+                    let b = measure(&blocks, reverse_postorder);
+                    let a = measure(&blocks, reference_postorder);
+                    (a, b)
+                };
+
+                original.push(a);
+                candidate.push(b);
+
+                println!(
+                    "blocks={} round={round}: \
+                    original={a:.3}ms candidate={b:.3}ms",
+                    blocks.len()
+                );
+            }
+
+            original.sort_by(f64::total_cmp);
+            candidate.sort_by(f64::total_cmp);
+
+            println!(
+                "MEDIAN blocks={}: \
+                 original={:.3}ms candidate={:.3}ms \
+                 speedup={:.3}x",
+                blocks.len(),
+                original[2],
+                candidate[2],
+                original[2] / candidate[2]
+            );
+        }
+    }
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
