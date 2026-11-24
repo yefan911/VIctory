@@ -102,6 +102,18 @@ impl<'a> Container<'a> {
                 data: body,
             });
         }
+        // Check ranges without changing the original part order.
+        let mut ranges: Vec<_> = parts
+            .iter()
+            .map(|p| (p.offset, p.offset + 8 + p.data.len()))
+            .collect();
+
+        ranges.sort_unstable();
+
+        if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            return Err(ShaderError::Malformed("overlapping parts"));
+        }
+
         Ok(Container {
             digest,
             version,
@@ -169,6 +181,46 @@ mod tests {
         assert_eq!(c.part(FourCC::SFI0).unwrap().data, &[1, 2, 3, 4]);
         assert_eq!(c.part(FourCC::HASH).unwrap().data.len(), 20);
         assert!(c.part(FourCC::DXIL).is_none());
+    }
+
+    #[test]
+    fn overlap_rejects_duplicate_offsets() {
+        let mut bytes = build(&[(FourCC::SFI0, &[0; 8]), (FourCC::HASH, &[])]);
+
+        let first = u32_at(&bytes, HEADER_SIZE).unwrap();
+
+        bytes[0x24..0x28].copy_from_slice(&first.to_le_bytes());
+
+        assert!(matches!(
+            Container::parse(&bytes),
+            Err(ShaderError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn overlap_rejects_nested_part() {
+        let mut bytes = build(&[(FourCC::SFI0, b"HASH\x00\x00\x00\x00"), (FourCC::HASH, &[])]);
+
+        let first = u32_at(&bytes, HEADER_SIZE).unwrap();
+        let nested = first + 8;
+
+        bytes[0x24..0x28].copy_from_slice(&nested.to_le_bytes());
+
+        assert!(matches!(
+            Container::parse(&bytes),
+            Err(ShaderError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn overlap_accepts_adjacent_empty_parts() {
+        let bytes = build(&[(FourCC::SFI0, &[]), (FourCC::HASH, &[])]);
+
+        let c = Container::parse(&bytes).unwrap();
+
+        assert_eq!(c.parts.len(), 2);
+        assert_eq!(c.parts[0].offset + 8, c.parts[1].offset);
+        assert!(c.parts.iter().all(|p| p.data.is_empty()));
     }
 
     #[test]
