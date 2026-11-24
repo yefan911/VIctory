@@ -32,6 +32,8 @@ pub mod lifecycle;
 pub mod media;
 #[cfg(windows)]
 pub mod net;
+/// Lexical Windows path rules, host-independent so CI covers them.
+pub(crate) mod paths;
 pub mod speech;
 pub mod storage;
 pub mod xasync;
