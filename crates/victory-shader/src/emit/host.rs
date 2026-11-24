@@ -62,39 +62,80 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// Checks that `device` supports Shader Model 6.6 (required for heap indexing).
+unsafe fn check_sm66(device: ID3D12Device) -> Result<ID3D12Device, String> {
+    let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+        HighestShaderModel: D3D_SHADER_MODEL_6_6,
+    };
+    // SAFETY: plain feature query with a valid out struct.
+    unsafe {
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+            .map_err(err)?;
+    }
+    if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+        return Err(format!(
+            "the device supports SM {:#x} only",
+            sm.HighestShaderModel.0
+        ));
+    }
+    Ok(device)
+}
+
 impl Host {
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// The high-performance hardware adapter (falling back to the default),
+    /// or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
-            let mut device: Option<ID3D12Device> = None;
             if warp {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
+                let mut device: Option<ID3D12Device> = None;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-            } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                return Ok(Host {
+                    device: check_sm66(device.ok_or("no device")?)?,
+                });
             }
-            let device = device.ok_or("no device")?;
-            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
-                HighestShaderModel: D3D_SHADER_MODEL_6_6,
-            };
-            device
-                .CheckFeatureSupport(
-                    D3D12_FEATURE_SHADER_MODEL,
-                    (&raw mut sm).cast(),
-                    size_of_val(&sm) as u32,
-                )
-                .map_err(err)?;
-            if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
-                return Err(format!(
-                    "the device supports SM {:#x} only",
-                    sm.HighestShaderModel.0
-                ));
+            if let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)) {
+                let mut last_err = None;
+                for i in 0u32.. {
+                    let Ok(adapter) = factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                        i,
+                        DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                    ) else {
+                        break;
+                    };
+                    if adapter
+                        .GetDesc1()
+                        .is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+                    {
+                        continue;
+                    }
+                    let mut device: Option<ID3D12Device> = None;
+                    match D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+                        .map_err(err)
+                        .and_then(|()| check_sm66(device.ok_or_else(|| "no device".to_string())?))
+                    {
+                        Ok(device) => return Ok(Host { device }),
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                if let Some(e) = last_err {
+                    return Err(e);
+                }
             }
-            Ok(Host { device })
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+            Ok(Host {
+                device: check_sm66(device.ok_or("no device")?)?,
+            })
         }
     }
 
@@ -1824,5 +1865,86 @@ impl Host {
             drop(keep);
             Ok(out)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn adapter_name(device: &ID3D12Device) -> Option<(windows::Win32::Foundation::LUID, String)> {
+        // SAFETY: plain DXGI/D3D12 queries with valid out pointers.
+        unsafe {
+            let luid = device.GetAdapterLuid();
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(luid).ok()?;
+            let desc = adapter.GetDesc1().ok()?;
+            let end = desc
+                .Description
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(desc.Description.len());
+            Some((luid, String::from_utf16_lossy(&desc.Description[..end])))
+        }
+    }
+
+    #[test]
+    fn hardware_host_prefers_high_performance_adapter() {
+        if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
+            let warp = Host::new(false).unwrap();
+            let (_, name) = adapter_name(&warp.device).unwrap();
+            assert!(
+                name.contains("Basic Render Driver"),
+                "expected WARP under VICTORY_WARP=1, got {name}"
+            );
+            return;
+        }
+        // Find the first non-software SM 6.6 adapter in high-performance order.
+        // SAFETY: plain DXGI/D3D12 queries with valid out pointers.
+        let expected = unsafe {
+            CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .ok()
+                .and_then(|f| {
+                    (0u32..)
+                        .map_while(|i| {
+                            f.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                                i,
+                                DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                            )
+                            .ok()
+                        })
+                        .find_map(|a| {
+                            let desc = a.GetDesc1().ok()?;
+                            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                                return None;
+                            }
+                            let mut dev: Option<ID3D12Device> = None;
+                            D3D12CreateDevice(&a, D3D_FEATURE_LEVEL_12_0, &mut dev).ok()?;
+                            let dev = dev?;
+                            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+                                HighestShaderModel: D3D_SHADER_MODEL_6_6,
+                            };
+                            dev.CheckFeatureSupport(
+                                D3D12_FEATURE_SHADER_MODEL,
+                                (&raw mut sm).cast(),
+                                size_of_val(&sm) as u32,
+                            )
+                            .ok()?;
+                            (sm.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0)
+                                .then(|| adapter_name(&dev))
+                                .flatten()
+                        })
+                })
+        };
+        let Some((want_luid, want_name)) = expected else {
+            return;
+        };
+        let host = Host::new(false).unwrap();
+        let (got_luid, got_name) = adapter_name(&host.device).unwrap();
+        assert_eq!(
+            (got_luid.LowPart, got_luid.HighPart),
+            (want_luid.LowPart, want_luid.HighPart),
+            "Host::new(false) picked {got_name:?}, want high-performance adapter {want_name:?}"
+        );
     }
 }
