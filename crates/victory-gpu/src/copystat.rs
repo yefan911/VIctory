@@ -93,14 +93,18 @@ pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
 }
 
+fn parse_mode(value: Option<&str>) -> u8 {
+    match value {
+        Some("plain") => 1,
+        Some("none") => 2,
+        _ => 0,
+    }
+}
+
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
 pub(crate) fn mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_COPY_MODE").as_deref() {
-        Ok("plain") => 1,
-        Ok("none") => 2,
-        _ => 0,
-    })
+    *MODE.get_or_init(|| parse_mode(std::env::var("VICTORY_COPY_MODE").ok().as_deref()))
 }
 
 /// Per source range (start, length): copies, bytes, microseconds, memory type.
@@ -196,6 +200,11 @@ pub(crate) fn page_faults() -> u64 {
 /// took most bytes.
 pub(crate) fn log(frames: f64) {
     static FAULTS: AtomicU64 = AtomicU64::new(0);
+    let frames = if frames.is_finite() && frames > 0.0 {
+        frames
+    } else {
+        1.0
+    };
     let faults = page_faults();
     let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
     let c: Vec<f64> = COUNT
@@ -320,5 +329,79 @@ pub(crate) fn log(frames: f64) {
             bytes as f64 / 1e6 / frames,
             us as f64 / 1e3 / frames
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn counter_enum_matches_array_length() {
+        assert_eq!(C::Submissions as usize, 0);
+        assert_eq!(C::TexChanged as usize + 1, COUNTERS);
+    }
+
+    #[test]
+    fn parse_mode_maps_known_and_unknown_values() {
+        assert_eq!(parse_mode(None), 0);
+        assert_eq!(parse_mode(Some("")), 0);
+        assert_eq!(parse_mode(Some("guarded")), 0);
+        assert_eq!(parse_mode(Some("plain")), 1);
+        assert_eq!(parse_mode(Some("none")), 2);
+    }
+
+    #[test]
+    fn range_accumulates_same_key_and_separates_distinct_ranges() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
+
+        range(0x1000, 64, 10, 0x20000);
+        range(0x1000, 64, 25, 0x20000);
+        range(0x2000, 128, 7, 0x40000);
+
+        let map = RANGES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .expect("ranges recorded");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&(0x1000, 64)), Some(&(2, 128, 35, 0x20000)));
+        assert_eq!(map.get(&(0x2000, 128)), Some(&(1, 128, 7, 0x40000)));
+    }
+
+    #[test]
+    fn add_and_log_drain_counters_and_ranges() {
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for a in &COUNT {
+            a.store(0, Relaxed);
+        }
+        RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
+
+        add(C::Submissions, 4);
+        add(C::Copies, 12);
+        add(C::CopyBytes, 4096);
+        add(C::TexChanged, 512);
+        let probe = 0u64;
+        range((&raw const probe) as usize, size_of::<u64>(), 3, 0);
+
+        // Zero and non-finite frame counts must not panic or divide by zero.
+        log(0.0);
+        for a in &COUNT {
+            assert_eq!(a.load(Relaxed), 0);
+        }
+        assert!(RANGES.lock().unwrap_or_else(|e| e.into_inner()).is_none());
+
+        add(C::Submissions, 2);
+        log(f64::NAN);
+        assert_eq!(COUNT[C::Submissions as usize].load(Relaxed), 0);
+    }
+
+    #[test]
+    fn page_faults_queries_current_process() {
+        // Current process always has at least one page fault since startup.
+        assert!(page_faults() > 0);
     }
 }
