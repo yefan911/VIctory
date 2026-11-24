@@ -103,6 +103,9 @@ fn text(s: &str) -> [u8; 64] {
 /// A struct this large comes back through the caller's buffer, whose
 /// address is also the return value.
 extern "system" fn analytics_info(_: This, out: *mut AnalyticsInfo) -> *mut AnalyticsInfo {
+    if out.is_null() {
+        return std::ptr::null_mut();
+    }
     let info = AnalyticsInfo {
         os: OS,
         hosting_os: OS,
@@ -396,5 +399,8 @@ mod tests {
         assert_eq!(size_of::<AnalyticsInfo>(), 0x90);
         assert_eq!(info.os.build, 22000);
         assert_eq!(&info.form[..14], b"Xbox Series X\0");
+
+        // A null output is refused rather than written through.
+        assert!(get(&ANALYTICS_OBJECT, std::ptr::null_mut()).is_null());
     }
 }
