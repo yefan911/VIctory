@@ -122,4 +122,89 @@ mod tests {
             (0x1D5, 16, 15.0)
         );
     }
+
+    #[test]
+    fn address_modes_map_all_eight_hardware_encodings() {
+        let expected = [1, 2, 3, 5, 3, 5, 4, 5];
+        for (raw, &d3d) in expected.iter().enumerate() {
+            let raw = raw as u32;
+            let s = StaticSampler::from_words([raw | (raw << 3) | (raw << 6), 0, 0, 0]);
+            assert_eq!(s.address, [d3d, d3d, d3d], "raw mode {raw}");
+        }
+    }
+
+    #[test]
+    fn anisotropy_clamps_above_sixteen_and_comparison_covers_all_eight() {
+        let expected_aniso = [1, 2, 4, 8, 16, 16, 16, 16];
+        for (raw, &aniso) in expected_aniso.iter().enumerate() {
+            let raw = raw as u32;
+            let s = StaticSampler::from_words([(raw << 9) | (raw << 12), 0, 0, 0]);
+            assert_eq!(s.max_anisotropy, aniso, "raw aniso {raw}");
+            assert_eq!(s.comparison, raw + 1, "raw comparison {raw}");
+        }
+    }
+
+    #[test]
+    fn mip_lod_bias_decodes_signed_14bit_fixed_point_extremes() {
+        let cases = [
+            (0x0000, 0.0_f32),
+            (0x0001, 1.0 / 256.0),
+            (0x1FFF, 8191.0 / 256.0),
+            (0x2000, -32.0),
+            (0x3FFF, -1.0 / 256.0),
+        ];
+        for (raw, expected) in cases {
+            let s = StaticSampler::from_words([0, 0, raw, 0]);
+            assert_eq!(s.mip_lod_bias, expected, "raw bias {raw:#x}");
+        }
+    }
+
+    #[test]
+    fn no_mip_filter_forces_zero_lod_range_and_non_zero_preserves_it() {
+        let w1 = (0xABC << 12) | 0x123;
+        let no_mip = StaticSampler::from_words([0, w1, 0, 0]);
+        assert_eq!((no_mip.min_lod, no_mip.max_lod), (0.0, 0.0));
+
+        let point_mip = StaticSampler::from_words([0, w1, 1 << 26, 0]);
+        assert_eq!(
+            (point_mip.min_lod, point_mip.max_lod),
+            (0x123 as f32 / 256.0, 0xABC as f32 / 256.0)
+        );
+        assert_eq!(point_mip.filter, 0);
+
+        let linear_mip = StaticSampler::from_words([0, w1, 2 << 26, 0]);
+        assert_eq!(linear_mip.filter, 1);
+    }
+
+    #[test]
+    fn filters_reductions_and_border_colours_decode_cleanly() {
+        // Non-aniso min/mag linear + linear mip with each reduction (including reserved 3 -> 0).
+        let base_w2 = (1 << 20) | (1 << 22) | (2 << 26);
+        assert_eq!(StaticSampler::from_words([0, 0, base_w2, 0]).filter, 0x15);
+        assert_eq!(
+            StaticSampler::from_words([1 << 29, 0, base_w2, 0]).filter,
+            0x115
+        );
+        assert_eq!(
+            StaticSampler::from_words([2 << 29, 0, base_w2, 0]).filter,
+            0x195
+        );
+        assert_eq!(
+            StaticSampler::from_words([3 << 29, 0, base_w2, 0]).filter,
+            0x15
+        );
+
+        // Either mag >= 2 or min >= 2 promotes to anisotropic filter 0x55.
+        assert_eq!(StaticSampler::from_words([0, 0, 2 << 20, 0]).filter, 0x55);
+        assert_eq!(
+            StaticSampler::from_words([1 << 29, 0, 3 << 22, 0]).filter,
+            0x155
+        );
+
+        // Border colours: 0..=2 pass through, 3 (custom) falls back to 0.
+        for (raw, expected) in [(0, 0), (1, 1), (2, 2), (3, 0)] {
+            let s = StaticSampler::from_words([0, 0, 0, raw << 30]);
+            assert_eq!(s.border, expected, "raw border {raw}");
+        }
+    }
 }
