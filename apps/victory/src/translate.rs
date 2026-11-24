@@ -71,7 +71,7 @@ struct Tally {
     ms_pipelines: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
-    /// With `--list`: one line per program and outcome.
+    /// With `--list`: per-program result rows, including runtime hashes.
     list: bool,
     lines: Vec<String>,
 }
@@ -479,9 +479,18 @@ fn translate(
     t: &mut Tally,
     checks: &mut Checks,
 ) {
-    let example = || format!("{}{}", path.display(), source.label());
+    let location = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
-        return t.fail("corrupt record".into(), example);
+        return t.fail("corrupt record".into(), location);
+    };
+    let list = t.list;
+    let hash = list.then(|| blake3::hash(&bytes).to_hex().to_string());
+    let example = || {
+        let location = location();
+        match &hash {
+            Some(hash) => format!("{location} hash={}", &hash[..16]),
+            None => location,
+        }
     };
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
@@ -495,8 +504,10 @@ fn translate(
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
     if !lock(seen).insert(blake3::hash(dxil)) {
-        t.duplicates += 1;
-        return;
+        if !list {
+            t.duplicates += 1;
+            return;
+        }
     }
     let programs = match native_programs(dxil) {
         Ok(p) => p,
