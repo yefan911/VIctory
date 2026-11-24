@@ -5843,14 +5843,38 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cndmask_b32" => {
-                let mask = match v.src.get(2) {
-                    Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                    _ => None,
+                let cond = match v.src.get(2) {
+                    Some(&Operand::Scalar { code, .. }) => {
+                        let m = inst
+                            .read(Reg::S(code))
+                            .and_then(|m| {
+                                self.x
+                                    .st
+                                    .masks
+                                    .get(&m)
+                                    .or_else(|| self.x.st.other.get(&m))
+                                    .copied()
+                            })
+                            .ok_or("a select on an untracked mask")?;
+                        self.boolean(m, c)?
+                    }
+                    Some(&Operand::Const(k)) => {
+                        let x =
+                            crate::resource::inline(k).ok_or("a select on an untracked mask")?;
+                        if x == 0 {
+                            self.s.m.bool(false)
+                        } else if x == u32::MAX {
+                            self.s.m.bool(true)
+                        } else if self.console_lanes {
+                            let lo = self.s.m.i32(x);
+                            let hi = self.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 });
+                            self.lane_bit(c, lo, Some(hi))
+                        } else {
+                            return Err("a constant lane mask");
+                        }
+                    }
+                    _ => return Err("a select on an untracked mask"),
                 };
-                let m = mask
-                    .and_then(|m| self.x.st.masks.get(&m).copied())
-                    .ok_or("a select on an untracked mask")?;
-                let cond = self.boolean(m, c)?;
                 if v.abs != 0 || v.neg != 0 {
                     // Sign-bit moves on the bits a select passes through
                     // (a host `fabs`/`fneg` may flush a denormal).
@@ -9992,6 +10016,24 @@ mod tests {
         for words in [add, sub] {
             lowers(&words, 0).unwrap();
         }
+    }
+
+    #[test]
+    fn v_cndmask_accepts_uniform_and_constant_masks() {
+        // Uniform select (`s_cselect_b32`) and inline constant masks in `v_cndmask_b32`
+        // (resolved in `Structured::other` or directly as constants).
+        let words = [
+            0xBF06_8000u32, // s_cmp_eq_u32 s0, 0
+            0x8500_80C1,    // s_cselect_b32 s0, -1, 0
+            0xD501_0001,
+            0x0001_0080,    // v_cndmask_b32 v1, 0, 1, s0
+            0xD501_0002,
+            0x0201_02C1,    // v_cndmask_b32 v2, 1, v1, -1
+            0xD834_0000,
+            0x0000_0200,    // ds_write_b32 v0, v2
+            S_ENDPGM,
+        ];
+        lowers(&words, 0x8001).unwrap();
     }
 
     fn perm_features(selector: u32) -> u64 {
