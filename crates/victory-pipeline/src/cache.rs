@@ -11,9 +11,12 @@ pub struct CacheKey(blake3::Hash);
 
 impl CacheKey {
     pub fn new(converter: &dyn Converter, input: &[u8]) -> Self {
+        let id = converter.id();
         let mut h = blake3::Hasher::new();
-        h.update(converter.id().as_bytes());
-        h.update(&[0]);
+        // Length-prefix the id so a NUL inside it cannot be mistaken for the
+        // old separator and collide with a different id/version pair.
+        h.update(&(id.len() as u64).to_le_bytes());
+        h.update(id.as_bytes());
         h.update(&converter.version().to_le_bytes());
         h.update(input);
         CacheKey(h.finalize())
@@ -149,6 +152,32 @@ mod tests {
             runs: AtomicUsize::new(0),
         };
         assert_ne!(CacheKey::new(&v1, b"x"), CacheKey::new(&v2, b"x"));
+    }
+
+    struct Keyed(&'static str, u32);
+
+    impl Converter for Keyed {
+        fn id(&self) -> &'static str {
+            self.0
+        }
+        fn version(&self) -> u32 {
+            self.1
+        }
+        fn convert(&self, _: &[u8]) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn id_and_version_are_delimited() {
+        assert_ne!(
+            CacheKey::new(&Keyed("a\0", 1), b""),
+            CacheKey::new(&Keyed("a", 256), b"")
+        );
+        assert_ne!(
+            CacheKey::new(&Keyed("a", 1), b"b"),
+            CacheKey::new(&Keyed("a", 1), b"")
+        );
     }
 
     #[test]
