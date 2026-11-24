@@ -225,6 +225,20 @@ extern "system" fn find_availability(
     put(out, 0)
 }
 
+extern "system" fn enumerate_chunk_availability(
+    _: This,
+    id: *const c_char,
+    _selector_count: u32,
+    _selectors: *const c_void,
+    _context: *mut c_void,
+    _callback: *const c_void,
+) -> HRESULT {
+    if !is_ours(id) {
+        return NO_PACKAGE;
+    }
+    S_OK
+}
+
 extern "system" fn change_order(
     _: This,
     id: *const c_char,
@@ -370,9 +384,9 @@ static VTABLE: Methods<40> = Methods([
     register_progress as *const (),     // 0x48
     unregister_progress as *const (),   // 0x50 unregister it
     missing::<11> as *const (),         // 0x58 user locale
-    find_availability as *const (),     // 0x60
-    missing::<13> as *const (),         // 0x68 enumerate chunk availability
-    change_order as *const (),          // 0x70
+    find_availability as *const (),             // 0x60
+    enumerate_chunk_availability as *const (),  // 0x68 enumerate chunk availability
+    change_order as *const (),                  // 0x70
     missing::<15> as *const (),         // 0x78 install chunks
     install_chunks_async as *const (),  // 0x80
     install_chunks_result as *const (), // 0x88
@@ -583,6 +597,38 @@ mod tests {
         assert_eq!(availability, 0, "ready");
         assert_eq!(
             find(this, c"dlc".as_ptr(), 0, none, &mut availability),
+            NO_PACKAGE
+        );
+
+        type EnumerateChunk = extern "system" fn(
+            This,
+            *const c_char,
+            u32,
+            *const c_void,
+            *mut c_void,
+            *const c_void,
+        ) -> HRESULT;
+        let enumerate_chunks = method::<EnumerateChunk>(&OBJECT, 0x68);
+        assert_eq!(
+            enumerate_chunks(
+                this,
+                ours.as_ptr().cast(),
+                0,
+                none,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            ),
+            S_OK
+        );
+        assert_eq!(
+            enumerate_chunks(
+                this,
+                c"dlc".as_ptr(),
+                0,
+                none,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            ),
             NO_PACKAGE
         );
 
