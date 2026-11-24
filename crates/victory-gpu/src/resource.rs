@@ -1723,9 +1723,15 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
 }
 extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
 extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
-    if !out.is_null() {
-        // SAFETY: checked non-null; the title passes room for a description.
-        unsafe { out.write(resource(this).desc) };
+    if let Some(out) = unsafe { out.as_mut() } {
+        let mut desc = resource(this).desc;
+        // Native D3D12 reports the levels it actually allocated for an
+        // automatically sized chain; keep the title's explicit value
+        // otherwise.
+        if desc.mip_levels == 0 {
+            desc.mip_levels = mip_count(&desc) as u16;
+        }
+        *out = desc;
     }
 }
 /// Device method `GetCustomHeapProperties`, returning its struct through a
@@ -2666,5 +2672,46 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn get_desc_reports_the_allocated_mip_chain() {
+        type Desc = extern "system" fn(This, *mut ResourceDesc);
+        let null = std::ptr::null();
+        let create = |desc: &ResourceDesc, out: &mut This| {
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    desc,
+                    0,
+                    null.cast(),
+                    &RESOURCE_IIDS[0],
+                    out,
+                ),
+                S_OK
+            );
+        };
+        let reported = |this: This| {
+            let mut desc = buffer(0);
+            slot::<Desc>(this, 0x50)(this, &mut desc);
+            desc.mip_levels
+        };
+
+        let mut automatic = null;
+        create(&texture(4, 4, 28, 0), &mut automatic);
+        assert_eq!(reported(automatic), 3, "4x4 has three levels");
+        assert_eq!(slot::<Release>(automatic, 0x10)(automatic), 0);
+
+        let mut explicit = null;
+        create(&texture(16, 16, 28, 2), &mut explicit);
+        assert_eq!(reported(explicit), 2, "explicit count is preserved");
+        assert_eq!(slot::<Release>(explicit, 0x10)(explicit), 0);
+
+        let mut buf = null;
+        create(&buffer(256), &mut buf);
+        assert_eq!(reported(buf), 1, "buffers have one level");
+        assert_eq!(slot::<Release>(buf, 0x10)(buf), 0);
     }
 }
