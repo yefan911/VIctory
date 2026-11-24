@@ -59,6 +59,9 @@ pub(crate) struct Staging {
 struct Last {
     hash: Option<blake3::Hash>,
     read: Vec<u8>,
+    /// Cached memory each subresource is detiled into before one sequential
+    /// copy to the (write-combined) staging buffer; kept across calls.
+    linear: Vec<u8>,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -311,12 +314,17 @@ impl Staging {
             // big pools is too slow to ask page by page.
             last.read.resize(size, 0);
             crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&last.read);
+            let Last { read, linear, .. } = last;
+            self.detile(read, linear);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return (size, true);
         }
-        if !committed(self.memory, size) {
+        // Copy the whole texture out first: asking `committed` (VirtualQuery
+        // per region) is slow, especially under Wine, while the read fails by
+        // itself if any page is not committed.
+        last.read.resize(size, 0);
+        if !crate::host::read_into(self.memory, &mut last.read) {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -326,23 +334,25 @@ impl Staging {
             );
             return (0, false);
         }
-        // SAFETY: committed memory of the texture's layout size.
-        let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = blake3::hash(&last.read);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
             return (size, false);
         }
         last.hash = Some(hash);
-        self.detile(tiled);
+        let Last { read, linear, .. } = last;
+        self.detile(read, linear);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         (size, true)
     }
 
-    /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
+    /// Detiles `tiled` (the texture's memory) into the staging buffer. The
+    /// buffer is a mapped upload heap (write-combined), where the scattered
+    /// writes of detiling are very slow: each subresource is detiled into
+    /// the cached `linear` memory, then copied over in one sequential pass.
+    fn detile(&self, tiled: &[u8], linear: &mut Vec<u8>) {
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -356,17 +366,26 @@ impl Staging {
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
-            let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
-            };
+            if linear.len() < len {
+                linear.resize(len, 0);
+            }
+            let scratch = &mut linear[..len];
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, mip, slice, scratch, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
             }
+            // SAFETY: the subresource's part of the mapped staging buffer,
+            // `len` bytes, which does not overlap the scratch memory.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    scratch.as_ptr(),
+                    self.data.add(footprint.Offset as usize),
+                    len,
+                )
+            };
         }
     }
 }
