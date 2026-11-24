@@ -307,22 +307,77 @@ pub extern "system" fn WSAConnectByList(
     timeout: *const c_void,
     reserved: *mut c_void,
 ) -> i32 {
-    if !list.is_null() {
-        // SAFETY: the title passes a `SOCKET_ADDRESS_LIST`.
-        let entries = unsafe {
-            let count = usize::try_from(list.cast::<i32>().read()).unwrap_or(0);
-            std::slice::from_raw_parts(list.add(8).cast::<SocketAddress>(), count)
-        };
-        if !entries
+    // SAFETY: the title passes a `SOCKET_ADDRESS_LIST` or null.
+    let entries = (!list.is_null()).then(|| unsafe {
+        let count = usize::try_from(list.cast::<i32>().read()).unwrap_or(0);
+        std::slice::from_raw_parts(list.add(8).cast::<SocketAddress>(), count)
+    });
+    if let Some(entries) = entries
+        && !entries
             .iter()
             .all(|e| reachable("network connect blocked", e.addr, e.len))
-        {
-            return 0;
-        }
+    {
+        return 0;
     }
-    host!("ws2_32.dll", "WSAConnectByList": extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)(
-        s, list, local_len, local, remote_len, remote, timeout, reserved,
-    )
+    static HOST: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    match *HOST.get_or_init(|| crate::host::function("ws2_32.dll", "WSAConnectByList")) {
+        Some(address) => {
+            type ConnectByList = extern "system" fn(
+                Socket,
+                *const u8,
+                *mut u32,
+                *mut c_void,
+                *mut u32,
+                *mut c_void,
+                *const c_void,
+                *mut c_void,
+            ) -> i32;
+            // SAFETY: the host's export, with this signature.
+            let host = unsafe { std::mem::transmute::<usize, ConnectByList>(address) };
+            host(
+                s, list, local_len, local, remote_len, remote, timeout, reserved,
+            )
+        }
+        None => connect_each(
+            s,
+            entries.unwrap_or_default(),
+            local_len,
+            local,
+            remote_len,
+            remote,
+        ),
+    }
+}
+
+/// `WSAConnectByList` where the host lacks it (Wine): `connect` to each
+/// candidate in turn until one takes. Blocking; the timeout is not kept.
+fn connect_each(
+    s: Socket,
+    entries: &[SocketAddress],
+    local_len: *mut u32,
+    local: *mut c_void,
+    remote_len: *mut u32,
+    remote: *mut c_void,
+) -> i32 {
+    const WSAEINVAL: i32 = 10022;
+    type Name = extern "system" fn(Socket, *mut c_void, *mut i32) -> i32;
+    let connect = host!("ws2_32.dll", "connect": extern "system" fn(Socket, *const u8, i32) -> i32);
+    let set_error = host!("ws2_32.dll", "WSASetLastError": extern "system" fn(i32));
+    if entries.is_empty() {
+        set_error(WSAEINVAL);
+        return 0;
+    }
+    if !entries.iter().any(|e| connect(s, e.addr, e.len) == 0) {
+        // `connect` left the last candidate's error.
+        return 0;
+    }
+    if !local.is_null() && !local_len.is_null() {
+        host!("ws2_32.dll", "getsockname": Name)(s, local, local_len.cast());
+    }
+    if !remote.is_null() && !remote_len.is_null() {
+        host!("ws2_32.dll", "getpeername": Name)(s, remote, remote_len.cast());
+    }
+    1
 }
 
 pub extern "system" fn WSAJoinLeaf(
@@ -580,7 +635,28 @@ pub extern "system" fn GetAddrInfoExA(
     if !resolvable(narrow(name)) {
         return WSAHOST_NOT_FOUND;
     }
-    host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
+    type GetAddrInfoExA = extern "system" fn(
+        *const c_char,
+        *const c_char,
+        u32,
+        *const c_void,
+        *const c_void,
+        *mut *mut c_void,
+        *const c_void,
+        *mut c_void,
+        *const c_void,
+        *mut Handle,
+    ) -> i32;
+    static HOST: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    // Hosts without the ANSI form (Wine): the name does not resolve, as for
+    // one we block.
+    let Some(address) = *HOST.get_or_init(|| crate::host::function("ws2_32.dll", "GetAddrInfoExA"))
+    else {
+        return WSAHOST_NOT_FOUND;
+    };
+    // SAFETY: the host's export, with this signature.
+    let host = unsafe { std::mem::transmute::<usize, GetAddrInfoExA>(address) };
+    host(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
     )
 }
@@ -896,6 +972,50 @@ mod tests {
     const HOME: [u8; 4] = [127, 0, 0, 1];
 
     #[test]
+    fn connect_by_list_falls_back_to_connect() {
+        // Also starts Winsock for the raw calls below.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let socket = host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket);
+        let close = host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32);
+        let s = socket(2, 1, 6);
+        assert_ne!(s, INVALID_SOCKET);
+        let home = v4(HOME, port);
+        let entries = [SocketAddress {
+            addr: home.as_ptr(),
+            len: 16,
+        }];
+        let (mut local, mut remote) = ([0u8; 16], [0u8; 16]);
+        let (mut local_len, mut remote_len) = (16u32, 16u32);
+        assert_eq!(
+            connect_each(
+                s,
+                &entries,
+                &mut local_len,
+                local.as_mut_ptr().cast(),
+                &mut remote_len,
+                remote.as_mut_ptr().cast(),
+            ),
+            1
+        );
+        listener.accept().unwrap();
+        assert_eq!(remote[2..8], home[2..8]);
+        assert_eq!(local[4..8], HOME);
+        close(s);
+        assert_eq!(
+            connect_each(
+                s,
+                &[],
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            0
+        );
+    }
+
+    #[test]
     fn only_loopback_is_reachable() {
         // Also starts Winsock for the raw calls below.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1048,11 +1168,16 @@ mod tests {
                 named.name
             );
         }
-        // Every override names a real export of its DLL. Some exports only
-        // exist on newer Windows (WinHttpGetProxySettingsEx is absent from
-        // Windows 10's winhttp.dll); the HLE supplies those itself, so skip
-        // them only when the host really lacks them.
-        const NEWER_WINDOWS_ONLY: &[&str] = &["WinHttpGetProxySettingsEx"];
+        // Every override names a real export of its DLL. Some exports are
+        // missing from some hosts (WinHttpGetProxySettingsEx from Windows
+        // 10's winhttp.dll; WSAConnectByList and GetAddrInfoExA from Wine's
+        // ws2_32.dll); the HLE does without those, so skip them only when the
+        // host really lacks them.
+        const NOT_EVERYWHERE: &[&str] = &[
+            "WinHttpGetProxySettingsEx",
+            "WSAConnectByList",
+            "GetAddrInfoExA",
+        ];
         for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
             let dll = if e.name.starts_with("WinHttp") {
                 "winhttp.dll"
@@ -1060,7 +1185,7 @@ mod tests {
                 "ws2_32.dll"
             };
             let present = crate::host::function(dll, e.name).is_some();
-            if !present && NEWER_WINDOWS_ONLY.contains(&e.name) {
+            if !present && NOT_EVERYWHERE.contains(&e.name) {
                 continue;
             }
             assert!(present, "{dll} lacks {}", e.name);
