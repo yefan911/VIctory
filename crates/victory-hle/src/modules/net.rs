@@ -626,6 +626,17 @@ pub extern "system" fn bind(s: Socket, name: *const u8, len: i32) -> i32 {
 
 // Forward lookups.
 
+/// Return the error used for a blocked name and clear the mandatory result
+/// pointer, matching Winsock's failed lookup behavior.
+fn blocked_forward_lookup(result: *mut *mut c_void) -> i32 {
+    // SAFETY: the Winsock caller provides a writable output pointer; `as_mut`
+    // checks for null before the result is cleared.
+    if let Some(result) = unsafe { result.as_mut() } {
+        *result = std::ptr::null_mut();
+    }
+    WSAHOST_NOT_FOUND
+}
+
 pub extern "system" fn getaddrinfo(
     node: *const c_char,
     service: *const c_char,
@@ -633,7 +644,7 @@ pub extern "system" fn getaddrinfo(
     result: *mut *mut c_void,
 ) -> i32 {
     if !resolvable(narrow(node)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_forward_lookup(result);
     }
     host!("ws2_32.dll", "getaddrinfo": extern "system" fn(*const c_char, *const c_char, *const c_void, *mut *mut c_void) -> i32)(
         node, service, hints, result,
@@ -647,7 +658,7 @@ pub extern "system" fn GetAddrInfoW(
     result: *mut *mut c_void,
 ) -> i32 {
     if !resolvable(wide(node)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_forward_lookup(result);
     }
     host!("ws2_32.dll", "GetAddrInfoW": extern "system" fn(*const u16, *const u16, *const c_void, *mut *mut c_void) -> i32)(
         node, service, hints, result,
@@ -667,7 +678,7 @@ pub extern "system" fn GetAddrInfoExA(
     handle: *mut Handle,
 ) -> i32 {
     if !resolvable(narrow(name)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_forward_lookup(result);
     }
     type GetAddrInfoExA = extern "system" fn(
         *const c_char,
@@ -708,7 +719,7 @@ pub extern "system" fn GetAddrInfoExW(
     handle: *mut Handle,
 ) -> i32 {
     if !resolvable(wide(name)) {
-        return WSAHOST_NOT_FOUND;
+        return blocked_forward_lookup(result);
     }
     host!("ws2_32.dll", "GetAddrInfoExW": extern "system" fn(*const u16, *const u16, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
@@ -1038,6 +1049,70 @@ mod tests {
         a[2..4].copy_from_slice(&port.to_be_bytes());
         a[4..8].copy_from_slice(&ip);
         a
+    }
+
+    #[test]
+    fn blocked_forward_lookups_clear_result_pointer() {
+        let mut result = 0x1234usize as *mut c_void;
+        assert_eq!(
+            getaddrinfo(
+                c"example.com".as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut result,
+            ),
+            WSAHOST_NOT_FOUND
+        );
+        assert!(result.is_null());
+
+        let name: Vec<u16> = "example.com\0".encode_utf16().collect();
+        result = 0x1234usize as *mut c_void;
+        assert_eq!(
+            GetAddrInfoW(
+                name.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut result,
+            ),
+            WSAHOST_NOT_FOUND
+        );
+        assert!(result.is_null());
+
+        result = 0x1234usize as *mut c_void;
+        assert_eq!(
+            GetAddrInfoExA(
+                c"example.com".as_ptr(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut result,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            ),
+            WSAHOST_NOT_FOUND
+        );
+        assert!(result.is_null());
+
+        result = 0x1234usize as *mut c_void;
+        assert_eq!(
+            GetAddrInfoExW(
+                name.as_ptr(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut result,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            ),
+            WSAHOST_NOT_FOUND
+        );
+        assert!(result.is_null());
     }
 
     // TEST-NET-1 (192.0.2.0/24): never routed, and never tried here.
