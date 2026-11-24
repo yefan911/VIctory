@@ -116,7 +116,7 @@ extern "system" fn analytics_info(_: This, out: *mut AnalyticsInfo) -> *mut Anal
     let info = AnalyticsInfo {
         os: OS,
         hosting_os: OS,
-        family: text("Xbox"),
+        family: text("Windows.Xbox"),
         form: text(victory_gpu::console::current().name()),
     };
     // SAFETY: the caller passes room for the struct.
@@ -491,6 +491,9 @@ mod tests {
         let info = unsafe { info.assume_init() };
         assert_eq!(size_of::<AnalyticsInfo>(), 0x90);
         assert_eq!(info.os.build, 22000);
+        // The GDK names the family `Windows.Xbox`, not `Xbox`.
+        assert_eq!(&info.family[..12], b"Windows.Xbox");
+        assert_eq!(info.family[12], 0);
         assert_eq!(&info.form[..14], b"Xbox Series X\0");
 
         // A null output is refused rather than written through.
