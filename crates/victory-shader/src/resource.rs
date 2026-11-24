@@ -196,11 +196,13 @@ pub fn track(
                 let source = t.descriptor(inst, op, b).map_err(fail)?;
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
                 if let Source::Loaded { load, .. } = source
+                    && load.0 == b
+                    && load.1 < i
                     && let Some((_, a)) = out.scalar.iter().find(|s| s.0 == load)
-                    && let Some(Term::Value(v)) = a.dynamic.map(|d| t.origin(d))
-                    && t.first_lane_source(v).is_some()
+                    && let Some(d) = a.dynamic
+                    && let Some(reads) = t.offset_reads(b, d)
                 {
-                    offset.push((v, load));
+                    offset.push((reads, load));
                 }
                 out.descriptors.push(Descriptor { site, role, source });
                 Ok(())
@@ -262,8 +264,8 @@ pub fn track(
             if !offset.is_empty() {
                 let (accesses, reads, loads) = offset_at.entry(b).or_default();
                 accesses.push(i);
-                for (v, load) in offset {
-                    reads.push(v);
+                for (vs, load) in offset {
+                    reads.extend(vs);
                     loads.push(load);
                 }
             }
@@ -288,9 +290,11 @@ pub fn track(
     }
     // Unproven, an offset read stays the first lane's (one uniform entry),
     // which is what the hardware reads outside a waterfall loop.
-    for (block, (accesses, mut reads, loads)) in offset_at {
+    for (block, (accesses, mut reads, mut loads)) in offset_at {
         reads.sort_unstable();
         reads.dedup();
+        loads.sort_unstable();
+        loads.dedup();
         if let Ok(proof) = t.waterfall(block, &accesses, &reads) {
             out.waterfall.compares.extend(proof.compares);
             out.waterfall.reads.extend(proof.reads);
@@ -1431,6 +1435,170 @@ impl<'a> Tracer<'a> {
             .collect()
     }
 
+    /// `v_readfirstlane_b32` results in `block` that feed the dynamic table
+    /// offset `dynamic` through pure 32-bit scalar arithmetic, or `None` if
+    /// none reach it or if an untracked / lane-mask / `EXEC` value does.
+    fn offset_reads(&self, block: usize, dynamic: Value) -> Option<Vec<Value>> {
+        let mut reads = Vec::new();
+        let mut verified = Vec::new();
+        self.collect_offset_reads(block, self.origin(dynamic), &mut reads, &mut verified, 0)
+            .then_some(reads)
+            .filter(|r| !r.is_empty())
+    }
+
+    fn collect_offset_reads(
+        &self,
+        block: usize,
+        term: Term,
+        reads: &mut Vec<Value>,
+        verified: &mut Vec<Value>,
+        depth: usize,
+    ) -> bool {
+        if depth >= MAX_ROUNDS {
+            return false;
+        }
+        let Term::Value(v) = term else {
+            return true;
+        };
+        if verified.contains(&v) {
+            return true;
+        }
+        if self.lanes.is_some_and(|l| l.masks.contains_key(&v)) {
+            return false;
+        }
+        if self.phis[v.0 as usize].is_some_and(|(pb, _)| pb == block) {
+            return false;
+        }
+        // Values defined outside `block` execute before the waterfall loop
+        // and stay invariant across its passes.
+        let Some((def_block, _)) = self.defs[v.0 as usize] else {
+            return true;
+        };
+        if def_block != block {
+            return true;
+        }
+        if self.first_lane_source(v).is_some() {
+            if !reads.contains(&v) {
+                reads.push(v);
+            }
+            verified.push(v);
+            return true;
+        }
+        let Some(inst) = self.def(v) else {
+            return false;
+        };
+        let Fields::Sop {
+            dst: Some(Operand::Scalar { code, dwords: 1 }),
+            src,
+            ..
+        } = &inst.fields
+        else {
+            return false;
+        };
+        if *code >= EXEC || inst.write(Reg::S(*code)) != Some(v) {
+            return false;
+        }
+        let mut check_op = |op: &Operand| -> bool {
+            if matches!(*op, Operand::Scalar { code, .. } if code >= EXEC) {
+                return false;
+            }
+            let Some(t) = self.term(inst, op) else {
+                return false;
+            };
+            self.collect_offset_reads(block, t, reads, verified, depth + 1)
+        };
+        let ok = match inst.name() {
+            "s_movk_i32" => true,
+            "s_mov_b32" | "s_brev_b32" | "s_not_b32" | "s_abs_i32" | "s_flbit_i32_b32"
+            | "s_flbit_i32" | "s_ff1_i32_b32" | "s_bcnt1_i32_b32" => {
+                src.first().is_some_and(check_op)
+            }
+            "s_addk_i32" | "s_mulk_i32" => check_op(&Operand::Scalar {
+                code: *code,
+                dwords: 1,
+            }),
+            "s_bitset0_b32" | "s_bitset1_b32" => {
+                check_op(&Operand::Scalar {
+                    code: *code,
+                    dwords: 1,
+                }) && src.first().is_some_and(check_op)
+            }
+            "s_add_u32" | "s_add_i32" | "s_sub_u32" | "s_sub_i32" | "s_mul_i32"
+            | "s_mul_hi_u32" | "s_mul_hi_i32" | "s_lshl_b32" | "s_lshr_b32" | "s_ashr_i32"
+            | "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32"
+            | "s_and_b32" | "s_or_b32" | "s_xor_b32" | "s_andn2_b32" | "s_orn2_b32"
+            | "s_nand_b32" | "s_nor_b32" | "s_xnor_b32" | "s_bfe_u32" | "s_bfe_i32"
+            | "s_bfm_b32" | "s_min_u32" | "s_max_u32" | "s_min_i32" | "s_max_i32" => {
+                src.first().is_some_and(&mut check_op) && src.get(1).is_some_and(check_op)
+            }
+            "s_cselect_b32" | "s_cmov_b32" => {
+                let clean_src = src
+                    .iter()
+                    .all(|op| !matches!(*op, Operand::Scalar { code, .. } if code >= EXEC));
+                let clean_dst = inst.name() != "s_cmov_b32" || *code < EXEC;
+                if clean_src
+                    && clean_dst
+                    && let Some((scc, set, clear)) = self.picked(v)
+                {
+                    self.collect_scc_reads(block, scc, reads, verified, depth + 1)
+                        && self.collect_offset_reads(block, set, reads, verified, depth + 1)
+                        && self.collect_offset_reads(block, clear, reads, verified, depth + 1)
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if ok {
+            verified.push(v);
+        }
+        ok
+    }
+
+    fn collect_scc_reads(
+        &self,
+        block: usize,
+        scc: Value,
+        reads: &mut Vec<Value>,
+        verified: &mut Vec<Value>,
+        depth: usize,
+    ) -> bool {
+        if depth >= MAX_ROUNDS || self.phis[scc.0 as usize].is_some_and(|(pb, _)| pb == block) {
+            return false;
+        }
+        let Some((def_block, _)) = self.defs[scc.0 as usize] else {
+            return true;
+        };
+        if def_block != block {
+            return true;
+        }
+        let Some(inst) = self.def(scc) else {
+            return false;
+        };
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return false;
+        };
+        let mut check_op = |op: &Operand| -> bool {
+            if matches!(*op, Operand::Scalar { code, .. } if code >= EXEC) {
+                return false;
+            }
+            let Some(t) = self.term(inst, op) else {
+                return false;
+            };
+            self.collect_offset_reads(block, t, reads, verified, depth + 1)
+        };
+        let name = inst.name();
+        if let Some(op) = name.strip_prefix("s_cmpk_") {
+            (op.ends_with("_i32") || op.ends_with("_u32")) && src.first().is_some_and(check_op)
+        } else if let Some(op) = name.strip_prefix("s_cmp_") {
+            (op.ends_with("_i32") || op.ends_with("_u32"))
+                && src.first().is_some_and(&mut check_op)
+                && src.get(1).is_some_and(check_op)
+        } else {
+            false
+        }
+    }
+
     /// `t` through VGPR copies (of VGPRs or of scalars) and copies.
     fn lane_term(&self, mut t: Term) -> Term {
         for _ in 0..MAX_JOINS * 2 {
@@ -1934,7 +2102,8 @@ impl<'a> Tracer<'a> {
                 } else {
                     continue;
                 };
-                let Some(matched) = mask(inst.write(Reg::S(code)), inst.write(Reg::S(code + 1))) else {
+                let Some(matched) = mask(inst.write(Reg::S(code)), inst.write(Reg::S(code + 1)))
+                else {
                     continue;
                 };
                 if meet(&[reach, (selected, true), (matched, false)]) {
@@ -2853,6 +3022,148 @@ pub(crate) mod tests {
         assert_eq!(r.waterfall.compares.len(), 1);
         assert_eq!(r.waterfall.reads.len(), 1);
         assert_eq!(r.waterfall.loads, [load]);
+    }
+
+    /// As [`WATERFALL_INDEXED_WAVE32`], with each lane holding the entry
+    /// index `lane & 1` and the loop scaling the first active lane's index
+    /// to a byte offset (`s_lshl_b32 s22, s20, 5`) before loading.
+    pub(crate) const WATERFALL_SCALED_INDEX_WAVE32: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0203,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x360E_0081, // v_and_b32 v7, 1, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE97_037E, // s_mov_b32 s23, exec_lo
+        0xBE95_037E, // s_mov_b32 s21, exec_lo
+        0x7E28_0507, // 0x3c: v_readfirstlane_b32 s20, v7
+        0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+        0x8F16_8514, // s_lshl_b32 s22, s20, 5
+        0xF40C_0302,
+        0x2C00_0000, // s_load_dwordx8 s[12:19], s[4:5], s22
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF09C_0F08,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+        0xBF89_FFF5, // s_cbranch_execnz -> 0x3c
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+
+    /// As [`WATERFALL_SCALED_INDEX_WAVE32`], scaling with `s_mul_i32` and
+    /// adding into the 64-bit table base inside the loop before loading.
+    pub(crate) const WATERFALL_ADDED_BASE_INDEX_WAVE32: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0203,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x360E_0081, // v_and_b32 v7, 1, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE97_037E, // s_mov_b32 s23, exec_lo
+        0xBE95_037E, // s_mov_b32 s21, exec_lo
+        0x7E28_0507, // 0x3c: v_readfirstlane_b32 s20, v7
+        0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+        0x9316_A014, // s_mul_i32 s22, s20, 32
+        0x8018_1604, // s_add_u32 s24, s4, s22
+        0x8219_8005, // s_addc_u32 s25, s5, 0
+        0xF40C_030C,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[24:25], null
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF09C_0F08,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+        0xBF89_FFF3, // s_cbranch_execnz -> 0x3c
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+
+    #[test]
+    fn the_console_waterfall_follows_scalar_index_arithmetic() {
+        let mut clamped = WATERFALL_SCALED_INDEX_WAVE32.to_vec();
+        let shift = clamped.iter().position(|&w| w == 0x8F16_8514).unwrap();
+        // Clamp s20 with s_cmpk_lt_u32 + s_cselect_b32 before shifting.
+        clamped.splice(shift..shift, [0xB694_0002, 0x8514_8214]);
+        let branch = clamped.iter().position(|&w| w == 0xBF89_FFF5).unwrap();
+        clamped[branch] = 0xBF89_FFF3;
+
+        for words in [
+            WATERFALL_SCALED_INDEX_WAVE32,
+            WATERFALL_ADDED_BASE_INDEX_WAVE32,
+            clamped.as_slice(),
+        ] {
+            let r = waterfall(words, false).unwrap();
+            let image = r
+                .descriptors
+                .iter()
+                .find(|d| d.role == Role::Resource)
+                .unwrap();
+            let Source::Loaded { load, first: 0 } = image.source else {
+                panic!("{:?}", image.source)
+            };
+            assert_eq!(r.waterfall.compares.len(), 1);
+            assert_eq!(r.waterfall.reads.len(), 1);
+            assert_eq!(r.waterfall.loads, [load]);
+        }
+    }
+
+    #[test]
+    fn a_first_lane_load_before_a_waterfall_loop_stays_uniform() {
+        let mut words = WATERFALL_SCALED_INDEX_WAVE32.to_vec();
+        // Replace the pre-loop sampler load with one whose offset was read
+        // via v_readfirstlane_b32 before the loop in block 0.
+        words.splice(
+            4..6,
+            [
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x7E14_0501, // v_readfirstlane_b32 s10, v1
+                0xF408_0203,
+                0x1400_0000, // s_load_dwordx4 s[8:11], s[6:7], s10
+            ],
+        );
+        let r = waterfall(&words, false).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        let Source::Loaded { load, first: 0 } = image.source else {
+            panic!("{:?}", image.source)
+        };
+        assert_eq!(load.0, 1);
+        assert_eq!(r.waterfall.compares.len(), 1);
+        assert_eq!(r.waterfall.reads.len(), 1);
+        assert_eq!(r.waterfall.loads, [load]);
+    }
+
+    #[test]
+    fn an_offset_reading_exec_is_no_waterfall() {
+        let mut words = WATERFALL_SCALED_INDEX_WAVE32.to_vec();
+        let shift = words.iter().position(|&w| w == 0x8F16_8514).unwrap();
+        words[shift] = 0x8716_7E14; // s_and_b32 s22, s20, exec_lo
+        let r = waterfall(&words, false).unwrap();
+        assert!(r.waterfall.compares.is_empty());
+        assert!(r.waterfall.reads.is_empty());
+        assert!(r.waterfall.loads.is_empty());
     }
 
     /// [`WATERFALL_JOINED_WAVE32`] with other sources on each path: lanes

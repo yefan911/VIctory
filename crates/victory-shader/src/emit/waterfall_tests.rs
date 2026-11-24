@@ -241,6 +241,25 @@ fn lanes_sample_the_entry_their_offset_names_in_the_console_waterfall() {
 }
 
 #[test]
+fn lanes_sample_the_entry_their_index_names_when_scaled_in_the_loop() {
+    use crate::resource::tests::{
+        WATERFALL_ADDED_BASE_INDEX_WAVE32, WATERFALL_SCALED_INDEX_WAVE32,
+    };
+    let want: Vec<f32> = (0..32).map(|l| [1.0, 2.0][l & 1]).collect();
+    for words in [
+        WATERFALL_SCALED_INDEX_WAVE32,
+        WATERFALL_ADDED_BASE_INDEX_WAVE32,
+    ] {
+        let shader = build(words, false);
+        let results = sampled(&shader);
+        assert!(!results.is_empty());
+        for (label, red) in results {
+            assert_eq!(red, want, "{label}");
+        }
+    }
+}
+
+#[test]
 fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
     use crate::resource::tests::cmpx_waterfall;
     // Lanes below 16 hold the first descriptor, the others the second.
