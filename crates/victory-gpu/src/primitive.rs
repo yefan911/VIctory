@@ -147,10 +147,12 @@ fn f32_to_half(v: f32) -> u16 {
         let m = q + u32::from(r > halfway || (r == halfway && (q & 1) != 0));
         return sign | m as u16;
     }
-    // Rounded to nearest: a carry out of the mantissa is added into the
-    // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
+    // Rounded to nearest, halfway cases to even (the retained bit decides);
+    // a carry out of the mantissa is added into the exponent (`2 - 2^-12`
+    // is 2.0); at most it reaches infinity, 0x7c00.
     let half = (exp as u32) << 10;
-    sign | (half + ((man + 0x1000) >> 13)) as u16
+    let retained = (man >> 13) & 1;
+    sign | (half + ((man + 0x0fff + retained) >> 13)) as u16
 }
 
 #[cfg(test)]
@@ -202,6 +204,16 @@ mod tests {
         let mut dst = vec![0u8; 6 * 2];
         expand_rects(&src, &mut dst, 2, &[(0, 54)]);
         assert_eq!(dst[10..], 0x4000_u16.to_le_bytes());
+    }
+
+    /// Halfway between two halves, the even one: 1 + 2^-11 lies between
+    /// 0x3c00 and 0x3c01, 1 + 3 * 2^-11 between 0x3c01 and 0x3c02.
+    #[test]
+    fn half_midpoints_round_to_even() {
+        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11)), 0x3c00);
+        assert_eq!(f32_to_half(1.0 + 3.0 * 2f32.powi(-11)), 0x3c02);
+        // Just past a midpoint still rounds up.
+        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11) + 2f32.powi(-20)), 0x3c01);
     }
 
     /// An element that reaches past the stride (float4 at 4 in 8-byte
