@@ -233,5 +233,35 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         !all.is_empty(),
         "no paths given and none configured (see victory.example.toml)"
     );
+    for p in &all {
+        victory_core::ensure_outside_repo(p)?;
+    }
     Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_paths_accepts_cli_paths() {
+        // CLI paths may include synthetic in-tree test fixtures.
+        let inside = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let res = default_paths(vec![inside.clone()]).unwrap();
+        assert_eq!(res, vec![inside]);
+    }
+
+    #[test]
+    fn default_paths_accepts_outside_path() {
+        let outside = std::env::temp_dir();
+        let res = default_paths(vec![outside.clone()]).unwrap();
+        assert_eq!(res, vec![outside]);
+    }
+
+    #[test]
+    fn default_paths_rejects_configured_inside_repo() {
+        let inside = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let err = victory_core::ensure_outside_repo(&inside).unwrap_err();
+        assert!(err.to_string().contains("inside"));
+    }
 }
