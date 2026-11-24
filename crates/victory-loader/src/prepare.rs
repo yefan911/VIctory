@@ -52,15 +52,27 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
     let characteristics = info.characteristics | file_flags::DLL;
     write_u16(
         &mut bytes,
-        fh + layout::FILE_HEADER_CHARACTERISTICS,
+        fh.checked_add(layout::FILE_HEADER_CHARACTERISTICS)
+            .ok_or(PrepareError::Patch("file header characteristics offset overflow"))?,
         characteristics,
     )?;
-    write_u32(&mut bytes, opt + layout::OPT_ADDRESS_OF_ENTRY_POINT, 0)?;
-    write_u32(&mut bytes, opt + layout::OPT_CHECKSUM, 0)?;
+    write_u32(
+        &mut bytes,
+        opt.checked_add(layout::OPT_ADDRESS_OF_ENTRY_POINT)
+            .ok_or(PrepareError::Patch("entry point offset overflow"))?,
+        0,
+    )?;
+    write_u32(
+        &mut bytes,
+        opt.checked_add(layout::OPT_CHECKSUM)
+            .ok_or(PrepareError::Patch("checksum offset overflow"))?,
+        0,
+    )?;
     let dll_characteristics = info.dll_characteristics & !dll_flags::FORCE_INTEGRITY;
     write_u16(
         &mut bytes,
-        opt + layout::OPT_DLL_CHARACTERISTICS,
+        opt.checked_add(layout::OPT_DLL_CHARACTERISTICS)
+            .ok_or(PrepareError::Patch("dll characteristics offset overflow"))?,
         dll_characteristics,
     )?;
 
@@ -89,16 +101,18 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         let at = info
             .rva_to_file_offset(tls.directory_rva)
             .ok_or(PrepareError::Patch("TLS directory is not file-backed"))?;
-        write_u64(
-            &mut bytes,
-            at as usize + layout::TLS64_ADDRESS_OF_CALLBACKS,
-            0,
-        )?;
+        let at_callbacks = (at as usize)
+            .checked_add(layout::TLS64_ADDRESS_OF_CALLBACKS)
+            .ok_or(PrepareError::Patch("TLS callback offset overflow"))?;
+        write_u64(&mut bytes, at_callbacks, 0)?;
         // The field's base relocation would turn the 0 into `delta` whenever
         // the loader maps the copy away from its preferred base (Wine always
         // does for DYNAMIC_BASE images), and the loader then reads callbacks
         // from there. Make that entry a no-op.
-        let field_rva = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
+        let field_rva = tls
+            .directory_rva
+            .checked_add(layout::TLS64_ADDRESS_OF_CALLBACKS as u32)
+            .ok_or(PrepareError::Patch("TLS callback RVA overflow"))?;
         for (entry, target) in dir64_relocations(&bytes, &info) {
             if target == field_rva {
                 write_u16(&mut bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
@@ -131,27 +145,38 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
     let Some(start) = info.rva_to_file_offset(rva).filter(|_| size != 0) else {
         return out;
     };
-    let (mut at, end) = (start as usize, start as usize + size as usize);
-    while at + 8 <= end {
+    let Some(end) = (start as usize).checked_add(size as usize) else {
+        return out;
+    };
+    let mut at = start as usize;
+    while let Some(header_end) = at.checked_add(8) {
+        if header_end > end {
+            break;
+        }
         let (Some(page), Some(block)) =
             (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4))
         else {
             break;
         };
         let block = block as usize;
-        if block < 8 || at + block > end {
+        let Some(next_at) = at.checked_add(block) else {
+            break;
+        };
+        if block < 8 || next_at > end {
             break;
         }
-        for entry in (at + 8..at + block).step_by(2) {
+        for entry in (at + 8..next_at).step_by(2) {
             let Some(e) = bytes.get(entry..entry + 2) else {
                 break;
             };
             let e = u16::from_le_bytes([e[0], e[1]]);
             if e >> 12 == DIR64 {
-                out.push((entry, page + u32::from(e & 0xFFF)));
+                if let Some(target) = page.checked_add(u32::from(e & 0xFFF)) {
+                    out.push((entry, target));
+                }
             }
         }
-        at += block;
+        at = next_at;
     }
     out
 }
@@ -166,8 +191,11 @@ fn write_u64(bytes: &mut [u8], at: usize, v: u64) -> Result<(), PrepareError> {
     write(bytes, at, &v.to_le_bytes())
 }
 fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
+    let end = at
+        .checked_add(v.len())
+        .ok_or(PrepareError::Patch("header field offset overflow"))?;
     bytes
-        .get_mut(at..at + v.len())
+        .get_mut(at..end)
         .ok_or(PrepareError::Patch("header field outside of file"))?
         .copy_from_slice(v);
     Ok(())
@@ -279,5 +307,23 @@ mod tests {
         let a = prepare(&original).unwrap();
         let b = prepare(&original).unwrap();
         assert_eq!(a.file_name(), b.file_name());
+    }
+
+    #[test]
+    fn write_rejects_overflowing_offsets() {
+        let mut bytes = vec![0u8; 16];
+        assert!(matches!(
+            write(&mut bytes, usize::MAX, &[1, 2]),
+            Err(PrepareError::Patch(_))
+        ));
+    }
+
+    #[test]
+    fn dir64_relocations_handles_empty_or_truncated_table() {
+        let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let info = ImageInfo::parse(&original).unwrap();
+        let bytes = vec![0u8; 32];
+        let relocs = dir64_relocations(&bytes, &info);
+        assert!(relocs.is_empty());
     }
 }
