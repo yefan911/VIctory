@@ -145,6 +145,13 @@ pub fn put<T>(out: *mut T, value: T) -> HRESULT {
 pub fn put_string(text: &str, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
     let len = text.len() + 1;
     if buffer.is_null() || size < len {
+        // String getters are called twice: once with no buffer to learn the
+        // required size, then with that many bytes. Report it even on the
+        // insufficient-buffer branch so the first call can be used.
+        if !used.is_null() {
+            // SAFETY: checked non-null.
+            unsafe { used.write(len) };
+        }
         return xasync::E_NOT_SUFFICIENT_BUFFER;
     }
     // SAFETY: the buffer holds `size` bytes, checked above.
@@ -340,5 +347,47 @@ mod tests {
             assert!(!kernel32.is_null(), "host DLLs still load from the host");
             assert!(!GetProcAddress(kernel32, c"GetTickCount".as_ptr().cast()).is_null());
         }
+    }
+
+    #[test]
+    fn string_getters_report_the_required_size() {
+        let none = std::ptr::null_mut();
+        let mut used = usize::MAX;
+        assert_eq!(
+            put_string("gamertag", 0, none, &mut used),
+            xasync::E_NOT_SUFFICIENT_BUFFER
+        );
+        assert_eq!(used, 9, "the NUL is part of the required size");
+
+        // The two-call pattern: query, then fetch exactly that many bytes.
+        let mut buffer = vec![0xffu8; used];
+        assert_eq!(
+            put_string("gamertag", buffer.len(), buffer.as_mut_ptr(), &mut used),
+            S_OK
+        );
+        assert_eq!(buffer, b"gamertag\0");
+        assert_eq!(used, 9);
+
+        // A short buffer reports the size too, and writes nothing.
+        let mut short = [0xffu8; 3];
+        used = 0;
+        assert_eq!(
+            put_string("gamertag", short.len(), short.as_mut_ptr(), &mut used),
+            xasync::E_NOT_SUFFICIENT_BUFFER
+        );
+        assert_eq!(used, 9);
+        assert_eq!(short, [0xff; 3]);
+
+        // Callers that do not ask for the size are still supported.
+        assert_eq!(
+            put_string("gamertag", 0, none, std::ptr::null_mut()),
+            xasync::E_NOT_SUFFICIENT_BUFFER
+        );
+        let mut empty = [0xffu8; 1];
+        assert_eq!(
+            put_string("", empty.len(), empty.as_mut_ptr(), std::ptr::null_mut()),
+            S_OK
+        );
+        assert_eq!(empty, [0]);
     }
 }
