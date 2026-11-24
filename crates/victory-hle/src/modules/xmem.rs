@@ -10,6 +10,7 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
@@ -357,6 +358,11 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 // mapping is a view of consecutive slices in place of a host placeholder.
 
 const PAGE: usize = 64 << 10;
+/// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
+/// 16. The title stores `number >> 4` in 21 bits.
+const FRAMES: usize = PAGE >> 12;
+const PAGE_NUMBER_LIMIT: usize = (1 << 21) * FRAMES;
+const FIRST_PAGE_NUMBER: usize = 0x10_0000;
 
 struct Section(HANDLE);
 
@@ -383,6 +389,7 @@ struct Slice {
 #[derive(Default)]
 struct Physical {
     next_page: usize,
+    free_pages: Vec<usize>,
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
@@ -446,10 +453,41 @@ fn report_written(shown: &[usize]) {
     }
 }
 
+impl Physical {
+    fn allocate(&mut self, section: Arc<Section>, numbers: &mut [MaybeUninit<usize>]) -> bool {
+        let fresh = numbers.len().saturating_sub(self.free_pages.len());
+        if fresh > (PAGE_NUMBER_LIMIT - self.next_page) / FRAMES {
+            return false;
+        }
+        for (index, out) in numbers.iter_mut().enumerate() {
+            let number = self.free_pages.pop().unwrap_or_else(|| {
+                let number = self.next_page;
+                self.next_page += FRAMES;
+                number
+            });
+            self.pages.insert(
+                number,
+                Slice {
+                    section: section.clone(),
+                    index,
+                },
+            );
+            out.write(number);
+        }
+        true
+    }
+
+    fn free(&mut self, number: usize) {
+        if self.pages.remove(&number).is_some() {
+            self.free_pages.push(number);
+        }
+    }
+}
+
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
     Mutex::new(Physical {
         // Page numbers are opaque to titles; 0 stays unused.
-        next_page: 0x10_0000,
+        next_page: FIRST_PAGE_NUMBER,
         ..Default::default()
     })
 });
@@ -469,6 +507,11 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
+    if n > (PAGE_NUMBER_LIMIT - FIRST_PAGE_NUMBER) / FRAMES {
+        // SAFETY: checked non-null.
+        unsafe { count.write(0) };
+        return 0;
+    }
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
@@ -502,27 +545,15 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
-    let mut physical = physical();
-    let first = physical.next_page;
-    physical.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
+    // SAFETY: the title passes room for `n` page numbers, which may be uninitialized.
+    let numbers = unsafe { std::slice::from_raw_parts_mut(pages.cast(), n) };
+    if !physical().allocate(Arc::new(Section(handle)), numbers) {
+        // SAFETY: checked non-null.
+        unsafe { count.write(0) };
+        return 0;
     }
     1
 }
-
-/// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
-/// 16: Grand Theft Auto VI keeps them as 21-bit `number >> 4` and rebuilds
-/// them with `<< 4` (128 GiB of pages at most).
-const FRAMES: usize = PAGE >> 12;
 
 /// Pages still mapped stay readable through their views until unmapped.
 pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
@@ -532,7 +563,7 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     let mut physical = physical();
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+        physical.free(unsafe { *pages.add(i) });
     }
     1
 }
@@ -1442,6 +1473,71 @@ mod tests {
     fn page_bytes(page: usize) -> Vec<u8> {
         let slice = physical().pages.get(&page).cloned().expect("known page");
         View::map(&slice, 1).expect("mapped").bytes().to_vec()
+    }
+
+    #[test]
+    fn freed_page_numbers_can_be_reused_at_the_limit() {
+        const CHILD: &str = "VICTORY_TEST_XMEM_PAGE_REUSE";
+        if std::env::var_os(CHILD).is_none() {
+            // Keep the seeded page allocator out of the other XMem tests.
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "modules::xmem::tests::freed_page_numbers_can_be_reused_at_the_limit",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        physical().next_page = PAGE_NUMBER_LIMIT - FRAMES;
+        let reserve = || {
+            let address = XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            );
+            assert!(!address.is_null());
+            address
+        };
+        let (old, new, alias) = (reserve(), reserve(), reserve());
+        let pages = allocate(1);
+        assert_eq!(pages[0] >> 4, (1 << 21) - 1);
+        assert_eq!(XMemMapPhysicalPages(old, 1, pages.as_ptr()), old);
+        assert!(write_physical(&pages, 0, &[7]));
+
+        let refused = |requested| {
+            let mut count = requested;
+            let mut output = [1, 2];
+            assert_eq!(
+                XMemAllocatePhysicalPages(0, &mut count, output.as_mut_ptr()),
+                0
+            );
+            assert_eq!(count, 0);
+            assert_eq!(output, [1, 2]);
+        };
+        refused(1);
+        refused(usize::MAX);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+        // A second free must not grant another use of the same number.
+        refused(2);
+        assert_eq!(allocate(1), pages);
+        assert_eq!(XMemMapPhysicalPages(new, 1, pages.as_ptr()), new);
+        assert!(map_alias(alias as u64, old as u64, PAGE as u64));
+        // SAFETY: the new view has just been mapped read-write.
+        assert_eq!(unsafe { new.cast::<u8>().read() }, 0);
+        assert!(write_physical(&pages, 0, &[9]));
+        // SAFETY: all three views are still mapped read-write.
+        unsafe {
+            assert_eq!(old.cast::<u8>().read(), 7);
+            assert_eq!(alias.cast::<u8>().read(), 7);
+            assert_eq!(new.cast::<u8>().read(), 9);
+        }
     }
 
     #[test]
