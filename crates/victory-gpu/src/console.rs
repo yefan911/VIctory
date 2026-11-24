@@ -56,3 +56,30 @@ pub fn current() -> Console {
         Console::SeriesX
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn series_x_is_the_default() {
+        assert_eq!(Console::default(), Console::SeriesX);
+    }
+
+    #[test]
+    fn title_memory_matches_the_published_figures() {
+        // Series X: 10 GiB GPU-optimal plus 3.5 GiB standard, 13.5 GiB in all.
+        let (gpu_optimal, standard) = Console::SeriesX.title_memory();
+        assert_eq!(gpu_optimal, 10 * GIB);
+        assert_eq!(standard, 3 * GIB + GIB / 2);
+        assert_eq!(gpu_optimal + standard, 27 * GIB / 2);
+        // Series S: one range of 7,776 MiB, counted as standard.
+        assert_eq!(Console::SeriesS.title_memory(), (0, 7_776 * 1024 * 1024));
+    }
+
+    #[test]
+    fn names_say_which_console() {
+        assert_eq!(Console::SeriesX.name(), "Xbox Series X");
+        assert_eq!(Console::SeriesS.name(), "Xbox Series S");
+    }
+}
