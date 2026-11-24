@@ -96,12 +96,13 @@ impl Title {
                 .map(|(_, text)| text.as_str())
         };
         let id = get("Game/TitleId").and_then(|v| u32::from_str_radix(v, 16).ok());
-        let storage_mb = get("Game/PersistentLocalStorage/SizeMB").and_then(|v| v.parse().ok());
+        let storage_mb =
+            get("Game/PersistentLocalStorage/SizeMB").and_then(|v| v.parse::<u64>().ok());
         Title {
             id: id.unwrap_or(0),
             store_id: get("Game/StoreId").unwrap_or_default().to_owned(),
             storage: PathBuf::new(),
-            storage_bytes: storage_mb.unwrap_or(0) << 20,
+            storage_bytes: storage_mb.unwrap_or(0).saturating_mul(1024 * 1024),
         }
     }
 
@@ -149,9 +150,15 @@ fn elements(text: &str) -> Vec<(String, String)> {
             .unwrap_or("");
         path.push(name);
         let body = rest[..rest.find('<').unwrap_or(rest.len())].trim();
-        let body = [("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&apos;", "'"), ("&amp;", "&")]
-            .iter()
-            .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c));
+        let body = [
+            ("&lt;", "<"),
+            ("&gt;", ">"),
+            ("&quot;", "\""),
+            ("&apos;", "'"),
+            ("&amp;", "&"),
+        ]
+        .iter()
+        .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c));
         out.push((path.join("/"), body));
         if closed {
             path.pop();
@@ -222,5 +229,24 @@ mod tests {
         assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 1024 << 20));
         assert_eq!(t.store_id, "9&C");
         assert_eq!(Title::from_manifest("").storage_bytes, 0);
+    }
+
+    #[test]
+    fn storage_quota_saturates_when_megabytes_exceed_u64_bytes() {
+        let max_mb = u64::MAX / (1024 * 1024);
+
+        let at_limit = format!(
+            "<Game><PersistentLocalStorage><SizeMB>{max_mb}</SizeMB></PersistentLocalStorage></Game>"
+        );
+        assert_eq!(
+            Title::from_manifest(&at_limit).storage_bytes,
+            max_mb * 1024 * 1024
+        );
+
+        let above_limit = format!(
+            "<Game><PersistentLocalStorage><SizeMB>{}</SizeMB></PersistentLocalStorage></Game>",
+            max_mb + 1
+        );
+        assert_eq!(Title::from_manifest(&above_limit).storage_bytes, u64::MAX);
     }
 }
