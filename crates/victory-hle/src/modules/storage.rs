@@ -76,7 +76,7 @@ extern "system" fn path(_: This, size: usize, buffer: *mut u8, used: *mut usize)
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SpaceInfo {
     /// Writable now.
     pub available_free: u64,
@@ -174,25 +174,226 @@ static VTABLE: Methods<8> = Methods([
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::c_void;
+    use std::path::Path;
+    use std::sync::{Mutex, MutexGuard};
+
     use super::*;
-    use crate::modules::xgameruntime::method;
+    use crate::modules::xasync::E_INVALIDARG;
+    use crate::modules::xgameruntime::{QueryApiImpl, method};
+
+    /// The title is process-wide, so the tests that set it take turns.
+    static TITLE_TESTS: Mutex<()> = Mutex::new(());
+
+    fn title_lock() -> MutexGuard<'static, ()> {
+        TITLE_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The title's own folder and quota, as the runner sets them.
+    fn set_storage(storage: &Path, bytes: u64) {
+        runtime::set_title(runtime::Title {
+            storage: storage.to_owned(),
+            storage_bytes: bytes,
+            ..Default::default()
+        });
+    }
+
+    fn new_block() -> AsyncBlock {
+        AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        }
+    }
+
+    type Size = extern "system" fn(This, *mut usize) -> HRESULT;
+    type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
+    type Space = extern "system" fn(This, *mut SpaceInfo) -> HRESULT;
+    type Prompt = extern "system" fn(This, u64, *mut AsyncBlock) -> HRESULT;
+    type PromptOutcome = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
+
+    #[test]
+    fn a_storage_folder_is_served_as_a_drive_root() {
+        let _title = title_lock();
+        runtime::set_title(runtime::Title::default());
+        assert_eq!(folder(), None, "no storage, no drive");
+
+        let dir = tempfile::tempdir().unwrap();
+        set_storage(dir.path(), 1000);
+        let drive = folder().expect("a title folder has a drive");
+        assert_eq!(drive.len(), 3, "a letter, a colon and the root separator");
+        assert!(drive.ends_with(":\\"), "{drive}");
+        assert!(drive.as_bytes()[0].is_ascii_uppercase(), "{drive}");
+        assert_eq!(folder(), Some(drive), "the same folder keeps its drive");
+    }
+
+    #[test]
+    fn both_interface_ids_serve_this_object() {
+        let mut out = std::ptr::null_mut::<c_void>();
+        for iid in [IID, IID_2026] {
+            assert_eq!(QueryApiImpl(&PROVIDER, &iid, &mut out), S_OK);
+            assert_eq!(out, (&OBJECT as *const Object).cast_mut().cast());
+        }
+    }
+
+    /// Before the runner sets a title, the path calls fail and leave the
+    /// title's buffers alone; there is no quota to report.
+    #[test]
+    fn path_calls_fail_until_the_title_has_storage() {
+        let _title = title_lock();
+        runtime::set_title(runtime::Title::default());
+        let this: This = &OBJECT;
+
+        let mut size = usize::MAX;
+        assert_eq!(path_size(this, &mut size), NOT_SUPPORTED);
+        assert_eq!(size, usize::MAX, "nothing written");
+
+        let mut buffer = [0xAAu8; 8];
+        let mut used = usize::MAX;
+        assert_eq!(
+            path(this, buffer.len(), buffer.as_mut_ptr(), &mut used),
+            NOT_SUPPORTED
+        );
+        assert_eq!((buffer, used), ([0xAA; 8], usize::MAX), "nothing written");
+
+        let mut info = SpaceInfo {
+            available_free: 1,
+            total_free: 2,
+            used: 3,
+            total: 4,
+        };
+        assert_eq!(space_info(this, &mut info), S_OK);
+        assert_eq!(info, SpaceInfo::default(), "no quota, no space");
+    }
+
+    /// The path is the drive root plus its NUL, and the size includes that
+    /// NUL; one byte less is the documented Xbox `E_FAIL` and writes nothing.
+    #[test]
+    fn the_path_is_the_drive_root_and_its_nul() {
+        let _title = title_lock();
+        let dir = tempfile::tempdir().unwrap();
+        set_storage(dir.path(), 1000);
+        let this: This = &OBJECT;
+
+        let mut size = 0;
+        assert_eq!(path_size(this, &mut size), S_OK);
+        assert_eq!(size, 4, "X:\\ and its NUL");
+        assert_eq!(path_size(this, std::ptr::null_mut()), E_INVALIDARG);
+
+        let mut expected = folder().unwrap().into_bytes();
+        expected.push(0);
+        let mut buffer = [0xAAu8; 4];
+        let mut used = 0;
+        assert_eq!(path(this, size, buffer.as_mut_ptr(), &mut used), S_OK);
+        assert_eq!(&buffer[..], &expected[..]);
+        assert_eq!(used, size, "the NUL counts as used");
+        // `pathUsed` is optional.
+        assert_eq!(
+            path(this, size, buffer.as_mut_ptr(), std::ptr::null_mut()),
+            S_OK
+        );
+
+        let mut small = [0xAAu8; 3];
+        let mut used = usize::MAX;
+        assert_eq!(path(this, 3, small.as_mut_ptr(), &mut used), E_FAIL);
+        assert_eq!((small, used), ([0xAA; 3], usize::MAX), "nothing written");
+        assert_eq!(path(this, 0, small.as_mut_ptr(), &mut used), E_FAIL);
+
+        // A null buffer cannot be written to.
+        let mut used = usize::MAX;
+        assert!(path(this, size, std::ptr::null_mut(), &mut used) < 0);
+        assert_eq!(used, usize::MAX, "nothing written");
+    }
+
+    #[test]
+    fn used_bytes_adds_every_file_under_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        std::fs::create_dir(dir.path().join("empty")).unwrap();
+        std::fs::write(dir.path().join("a.bin"), [0u8; 100]).unwrap();
+        std::fs::write(dir.path().join("nested/b.bin"), [0u8; 300]).unwrap();
+        std::fs::write(dir.path().join("empty/c.bin"), b"").unwrap();
+        assert_eq!(used_bytes(dir.path()), 400);
+        assert_eq!(used_bytes(&dir.path().join("empty")), 0, "no files");
+        assert_eq!(
+            used_bytes(&dir.path().join("missing")),
+            0,
+            "a folder that cannot be read holds nothing"
+        );
+    }
+
+    /// Writable is the quota's rest, as far as the host disk allows; the
+    /// rest of the quota is what a prompt can ask for.
+    #[test]
+    fn space_reports_the_quotas_rest_and_the_hosts_free_bytes() {
+        let _title = title_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("save.dat"), [0u8; 100]).unwrap();
+        std::fs::write(dir.path().join("nested.dat"), [0u8; 50]).unwrap();
+        set_storage(dir.path(), 1000);
+        let this: This = &OBJECT;
+
+        let mut info = SpaceInfo::default();
+        assert_eq!(space_info(this, &mut info), S_OK);
+        assert_eq!((info.used, info.total_free, info.total), (150, 850, 1000));
+        assert_eq!(
+            info.available_free,
+            info.total_free.min(disk_free(dir.path()))
+        );
+
+        // Over the quota, nothing is free however full the host disk is.
+        std::fs::write(dir.path().join("big.dat"), vec![0u8; 1000]).unwrap();
+        assert_eq!(space_info(this, &mut info), S_OK);
+        assert_eq!(
+            (info.used, info.total_free, info.total, info.available_free),
+            (1150, 0, 1000, 0)
+        );
+
+        // A folder that does not exist yet uses nothing; the host disk's
+        // space is unknown, so the quota is all there is.
+        set_storage(&dir.path().join("missing"), 500);
+        assert_eq!(space_info(this, &mut info), S_OK);
+        assert_eq!(
+            (info.used, info.total_free, info.total, info.available_free),
+            (0, 500, 500, 500)
+        );
+
+        assert_eq!(space_info(this, std::ptr::null_mut()), E_INVALIDARG);
+    }
+
+    #[test]
+    fn the_space_prompt_grants_only_what_the_quota_leaves() {
+        let _title = title_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("save.dat"), [0u8; 100]).unwrap();
+        set_storage(dir.path(), 1000);
+        let this: This = &OBJECT;
+        let prompt: Prompt = prompt_for_space;
+        let outcome: PromptOutcome = prompt_result;
+
+        for (bytes, expected) in [(0, S_OK), (900, S_OK), (901, E_ABORT), (u64::MAX, E_ABORT)] {
+            let mut block = new_block();
+            assert_eq!(prompt(this, bytes, &mut block), S_OK, "{bytes} bytes");
+            assert_eq!(xasync::XAsyncGetStatus(&mut block, true), expected);
+            assert_eq!(outcome(this, &mut block), expected, "{bytes} bytes");
+            // The result is a status, not a one-shot result: reading it
+            // again gives the same answer.
+            assert_eq!(outcome(this, &mut block), expected, "{bytes} bytes again");
+        }
+
+        // A null block starts no call and reads no result.
+        assert_eq!(prompt(this, 1, std::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(outcome(this, std::ptr::null_mut()), E_INVALIDARG);
+    }
 
     #[test]
     fn serves_a_drive_over_the_title_folder_and_its_quota() {
-        type Size = extern "system" fn(This, *mut usize) -> HRESULT;
-        type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
-        type Space = extern "system" fn(This, *mut SpaceInfo) -> HRESULT;
-        type Prompt = extern "system" fn(This, u64, *mut AsyncBlock) -> HRESULT;
-        type Result = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
+        let _title = title_lock();
         let this: This = &OBJECT;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("save.dat"), [0u8; 100]).unwrap();
-        runtime::set_title(runtime::Title {
-            id: 1,
-            storage: dir.path().to_owned(),
-            storage_bytes: 1000,
-            ..Default::default()
-        });
+        set_storage(dir.path(), 1000);
 
         // The path is a drive root, never the host folder.
         let mut size = 0;
@@ -214,24 +415,14 @@ mod tests {
             0
         );
 
-        let mut info = SpaceInfo {
-            available_free: 0,
-            total_free: 0,
-            used: 0,
-            total: 0,
-        };
+        let mut info = SpaceInfo::default();
         assert_eq!(method::<Space>(&OBJECT, 0x28)(this, &mut info), S_OK);
         assert_eq!((info.used, info.total_free, info.total), (100, 900, 1000));
 
         let prompt = method::<Prompt>(&OBJECT, 0x30);
-        let result = method::<Result>(&OBJECT, 0x38);
+        let result = method::<PromptOutcome>(&OBJECT, 0x38);
         for (bytes, expect) in [(900, S_OK), (901, E_ABORT)] {
-            let mut block = AsyncBlock {
-                queue: std::ptr::null(),
-                context: std::ptr::null_mut(),
-                callback: None,
-                internal: [0; 4],
-            };
+            let mut block = new_block();
             assert_eq!(prompt(this, bytes, &mut block), S_OK);
             assert_eq!(xasync::XAsyncGetStatus(&mut block, true), expect);
             assert_eq!(result(this, &mut block), expect, "{bytes} bytes");

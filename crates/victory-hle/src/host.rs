@@ -238,3 +238,141 @@ mod imp {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn name(text: &str) -> ImportSymbol {
+        ImportSymbol::Name {
+            hint: 0,
+            name: text.into(),
+        }
+    }
+
+    /// What the console shares with the PC passes through; console-only
+    /// DLLs and look-alike names never do.
+    #[test]
+    fn the_default_policy_is_an_allow_list() {
+        let policy = HostPolicy::default();
+        for dll in [
+            "KERNEL32.DLL",
+            "kernelbase.dll",
+            "ntdll.dll",
+            "ucrtbase.dll",
+            "vcruntime140.dll",
+            "vcruntime140_1.dll",
+            "msvcp140.dll",
+            "msvcp_win.dll",
+            "api-ms-win-core-synch-l1-2-0.dll",
+            "api-ms-win-eventing-provider-l1-1-0.dll",
+            "api-ms-win-security-base-l1-2-0.dll",
+            "api-ms-win-crt-runtime-l1-1-0.dll",
+            "ext-ms-win-rtcore-ntuser-window-l1-1-0.dll",
+            "api-ms-win-shcore-scaling-l1-1-1.dll",
+            "ws2_32.dll",
+            "bcrypt.dll",
+            "crypt32.dll",
+            "ncrypt.dll",
+            "winhttp.dll",
+            "sspicli.dll",
+            "cabinet.dll",
+            "avrt.dll",
+            "dbghelp.dll",
+            "xaudio2_9.dll",
+            "mfplat.dll",
+            "mfreadwrite.dll",
+            "ole32.dll",
+            "advapi32.dll",
+            "iphlpapi.dll",
+        ] {
+            assert!(policy.allows(dll), "{dll}");
+        }
+        for dll in [
+            "",
+            "xmem.dll",
+            "xgameruntime.dll",
+            "d3d12_xs.dll",
+            "d3d11.dll",
+            "dxgi.dll",
+            "wininet.dll",
+            "urlmon.dll",
+            "user32.dll",
+            "xinput1_4.dll",
+            "kernel32.dll.evil",
+            "kernel32",
+            "notkernel32.dll",
+            "api-ms-win-corex.dll",
+            "msvcp.dll",
+        ] {
+            assert!(!policy.allows(dll), "{dll}");
+        }
+        assert!(!HostPolicy::none().allows("kernel32.dll"));
+        assert!(!HostPolicy::none().allows(""));
+    }
+
+    /// A pattern is a whole name or, with a trailing `*`, a prefix; a DLL
+    /// name's case never matters.
+    #[test]
+    fn dll_names_match_case_insensitively_by_name_or_prefix() {
+        let policy = HostPolicy {
+            allow: vec!["kernel32.dll".into(), "api-ms-win-core-*".into()],
+        };
+        assert!(policy.allows("Kernel32.DLL"));
+        assert!(policy.allows("api-ms-win-core-file-l1-1-0.dll"));
+        assert!(policy.allows("API-MS-WIN-CORE-FILE-L1-1-0.DLL"));
+        assert!(!policy.allows("kernel32.dll.old"));
+        assert!(!policy.allows("kernel32"));
+        assert!(!policy.allows("my-kernel32.dll"));
+        assert!(!policy.allows("api-ms-win-core"));
+        assert!(!policy.allows("api-ms-win-corex.dll"));
+        assert!(!policy.allows("api-ms-win-eventing-provider-l1-1-0.dll"));
+
+        assert!(!HostPolicy { allow: Vec::new() }.allows("kernel32.dll"));
+    }
+
+    /// Allowed DLLs resolve to the host's functions; console-only names
+    /// and nameless lookups resolve to nothing.
+    #[cfg(windows)]
+    #[test]
+    fn allowed_dlls_resolve_to_the_hosts_own_functions() {
+        let policy = HostPolicy::default();
+        let tick = policy.resolve("kernel32.dll", &name("GetTickCount"));
+        assert!(tick.is_some());
+        assert_eq!(
+            policy.resolve("KERNEL32.DLL", &name("GetTickCount")),
+            tick,
+            "one module per DLL, whatever the case"
+        );
+        assert_eq!(function("kernel32.dll", "GetTickCount"), tick);
+        assert_eq!(policy.resolve("kernel32.dll", &name("NotAnExport")), None);
+        assert_eq!(function("kernel32.dll", "NotAnExport"), None);
+
+        // The policy decides, not the presence of the name on this host.
+        assert_eq!(
+            policy.resolve("xmem.dll", &name("XMemSetAllocationHooks")),
+            None
+        );
+        assert_eq!(
+            HostPolicy::none().resolve("kernel32.dll", &name("GetTickCount")),
+            None
+        );
+        // An allow-listed name the host does not have is a miss, not a panic.
+        assert_eq!(
+            policy.resolve("api-ms-win-core-nothing-l1-1-0.dll", &name("Nothing")),
+            None
+        );
+        // Winsock keeps its documented ordinals.
+        assert!(
+            policy
+                .resolve("ws2_32.dll", &ImportSymbol::Ordinal(1))
+                .is_some()
+        );
+        // GetProcAddress cannot take an empty or split name.
+        assert_eq!(policy.resolve("kernel32.dll", &name("")), None);
+        assert_eq!(
+            policy.resolve("kernel32.dll", &name("GetTick\0Count")),
+            None
+        );
+    }
+}
