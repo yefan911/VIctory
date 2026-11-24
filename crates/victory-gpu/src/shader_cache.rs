@@ -161,15 +161,19 @@ const STAGES: [HwStage; 8] = [
     HwStage::Cs,
 ];
 
+/// The raw root type values, as the console shader stores them. Keep these
+/// in step with `RootType::from_raw` in `victory-shader`: a second numbering
+/// here used to overflow for `Other(u32::MAX)` and decoded native values
+/// into the wrong variant.
 fn root_code(r: RootType) -> u32 {
     match r {
         RootType::Constants => 0,
         RootType::Descriptor => 1,
-        RootType::Table => 2,
-        RootType::ImmediateSampler => 3,
-        RootType::ResourceHeap => 4,
-        RootType::SamplerHeap => 5,
-        RootType::Other(x) => 6 + x,
+        RootType::Table => 3,
+        RootType::ImmediateSampler => 4,
+        RootType::ResourceHeap => 5,
+        RootType::SamplerHeap => 6,
+        RootType::Other(x) => x,
     }
 }
 
@@ -177,11 +181,11 @@ fn root_type(code: u32) -> RootType {
     match code {
         0 => RootType::Constants,
         1 => RootType::Descriptor,
-        2 => RootType::Table,
-        3 => RootType::ImmediateSampler,
-        4 => RootType::ResourceHeap,
-        5 => RootType::SamplerHeap,
-        x => RootType::Other(x - 6),
+        3 => RootType::Table,
+        4 => RootType::ImmediateSampler,
+        5 => RootType::ResourceHeap,
+        6 => RootType::SamplerHeap,
+        x => RootType::Other(x),
     }
 }
 
@@ -447,6 +451,25 @@ mod tests {
                 .unwrap()
                 .contains("fn encode(translation: &Result<HostShader, String>)")
         );
+    }
+
+    /// The cache must use the same numbers as the console shader: a second
+    /// numbering lost `Other(2)` and overflowed on large unknown values.
+    #[test]
+    fn root_types_round_trip_native_codes() {
+        for (root, code) in [
+            (RootType::Constants, 0),
+            (RootType::Descriptor, 1),
+            (RootType::Other(2), 2),
+            (RootType::Table, 3),
+            (RootType::ImmediateSampler, 4),
+            (RootType::ResourceHeap, 5),
+            (RootType::SamplerHeap, 6),
+            (RootType::Other(u32::MAX), u32::MAX),
+        ] {
+            assert_eq!(root_code(root), code, "{root:?}");
+            assert_eq!(root_type(code), root, "{code:#x}");
+        }
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
