@@ -217,6 +217,8 @@ impl Bits<'_> {
 struct Vlc {
     /// Left-aligned code, length, symbol; sorted by code.
     codes: Vec<(u32, u8, i32)>,
+    /// Candidate range for each leading eight-bit prefix.
+    prefixes: [(usize, usize); 256],
 }
 
 impl Vlc {
@@ -227,12 +229,26 @@ impl Vlc {
             codes.push((code as u32, len, symbol));
             code += 1 << (32 - len);
         }
-        Vlc { codes }
+        let prefixes = std::array::from_fn(|prefix| {
+            let low = (prefix as u32) << 24;
+            let high = low | 0x00ff_ffff;
+            let first = codes.partition_point(|c| c.0 <= low) - 1;
+            let end = codes.partition_point(|c| c.0 <= high);
+            (first, end)
+        });
+        Vlc { codes, prefixes }
     }
 
     fn read(&self, bits: &mut Bits) -> i32 {
         let v = bits.peek32();
-        let i = self.codes.partition_point(|c| c.0 <= v) - 1;
+        let (first, end) = self.prefixes[(v >> 24) as usize];
+        let i = if end == first + 1 {
+            first
+        } else {
+            first
+                + self.codes[first..end].partition_point(|c| c.0 <= v)
+                - 1
+        };
         let (_, len, symbol) = self.codes[i];
         bits.pos += len as usize;
         symbol
@@ -1156,6 +1172,195 @@ fn to_i16(v: f32) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    fn vlc_books() -> [&'static Vlc; 7] {
+        let c = codes();
+        [
+            &c.scale,
+            &c.scale_rl,
+            &c.coef[0],
+            &c.coef[1],
+            &c.vec4,
+            &c.vec2,
+            &c.vec1,
+        ]
+    }
+
+    fn vlc_reference(vlc: &Vlc, bits: &mut Bits<'_>) -> i32 {
+        let v = bits.peek32();
+        let i = vlc.codes.partition_point(|c| c.0 <= v) - 1;
+        let (_, len, symbol) = vlc.codes[i];
+        bits.pos += len as usize;
+        symbol
+    }
+
+    #[test]
+    fn vlc_prefix_matches_binary_search() {
+        for book in vlc_books() {
+            let mut probes = vec![0, u32::MAX];
+
+            for &(code, _, _) in &book.codes {
+                probes.push(code);
+                probes.push(code.saturating_sub(1));
+                probes.push(code.saturating_add(1));
+            }
+
+            for prefix in 0..256u32 {
+                probes.push(prefix << 24);
+                probes.push((prefix << 24) | 0x00ff_ffff);
+            }
+
+            let mut seed = 123456789u32;
+            for _ in 0..4096 {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                probes.push(seed);
+            }
+
+            for value in probes {
+                for shift in 0..8usize {
+                    let data =
+                        (u64::from(value) << (32 - shift))
+                            .to_be_bytes();
+
+                    let mut expected = Bits {
+                        data: &data,
+                        pos: shift,
+                        end: 64,
+                    };
+
+                    let mut actual = Bits {
+                        data: &data,
+                        pos: shift,
+                        end: 64,
+                    };
+
+                    assert_eq!(
+                        book.read(&mut actual),
+                        vlc_reference(book, &mut expected),
+                        "value={value:#x}, shift={shift}"
+                    );
+
+                    assert_eq!(actual.pos, expected.pos);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "synthetic release microbenchmark"]
+    fn vlc_prefix_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn measure<const OPT: bool>(
+            samples: &[(usize, [u8; 4])],
+            books: &[&Vlc; 7],
+        ) -> (f64, i64) {
+            let start = Instant::now();
+            let mut sum = 0i64;
+
+            for _ in 0..64 {
+                for &(index, ref data) in samples {
+                    let book = black_box(books[index]);
+
+                    let mut bits = Bits {
+                        data: black_box(data),
+                        pos: 0,
+                        end: 32,
+                    };
+
+                    let symbol = if OPT {
+                        book.read(&mut bits)
+                    } else {
+                        vlc_reference(book, &mut bits)
+                    };
+
+                    sum = sum
+                        .wrapping_add(i64::from(symbol))
+                        .wrapping_add(bits.pos as i64);
+                }
+            }
+
+            (
+                start.elapsed().as_secs_f64() * 1000.0,
+                black_box(sum),
+            )
+        }
+
+        let books = vlc_books();
+
+        for (label, short_only) in [
+            ("all_codes", false),
+            ("short_codes", true),
+        ] {
+            let mut corpus = Vec::new();
+
+            for (index, book) in books.iter().enumerate() {
+                for &(code, len, _) in &book.codes {
+                    if !short_only || len <= 8 {
+                        corpus.push((index, code.to_be_bytes()));
+                    }
+                }
+            }
+
+            assert!(!corpus.is_empty());
+
+            let mut seed = 123456789u32;
+
+            let samples: Vec<_> = (0..16384)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    corpus[seed as usize % corpus.len()]
+                })
+                .collect();
+
+            let warmup_a = measure::<false>(&samples, &books);
+            let warmup_b = measure::<true>(&samples, &books);
+            assert_eq!(warmup_a.1, warmup_b.1);
+
+            let mut reference = Vec::new();
+            let mut candidate = Vec::new();
+
+            for round in 0..5 {
+                let (a, b) = if round % 2 == 0 {
+                    let a = measure::<false>(&samples, &books);
+                    let b = measure::<true>(&samples, &books);
+                    (a, b)
+                } else {
+                    let b = measure::<true>(&samples, &books);
+                    let a = measure::<false>(&samples, &books);
+                    (a, b)
+                };
+
+                assert_eq!(a.1, b.1);
+                reference.push(a.0);
+                candidate.push(b.0);
+
+                println!(
+                    "{label} round={round}: \
+                     reference={:.3}ms candidate={:.3}ms",
+                    a.0, b.0
+                );
+            }
+
+            reference.sort_by(f64::total_cmp);
+            candidate.sort_by(f64::total_cmp);
+
+            println!(
+                "MEDIAN {label}: \
+                 reference={:.3}ms candidate={:.3}ms \
+                 speedup={:.3}x checksum=OK",
+                reference[2],
+                candidate[2],
+                reference[2] / candidate[2]
+            );
+        }
+    }
 
     /// Writes `value` as `n` bits, MSB first, at bit `pos`.
     fn put_bits(data: &mut [u8], pos: usize, n: u32, value: u32) {
