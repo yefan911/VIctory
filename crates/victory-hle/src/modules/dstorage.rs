@@ -632,8 +632,9 @@ fn staging_bytes(request: &Request) -> u64 {
     }
 }
 
-/// Ends a queue: what was not started is dropped, and this waits for the
-/// reads already running (they write title memory).
+/// Ends a queue: what was enqueued but not submitted is dropped, and this
+/// waits until what was submitted has completed or failed, its status
+/// entries written, as the console's `Close` does.
 fn close_lane(id: u64) {
     let Some(scheduler) = scheduler() else {
         return;
@@ -644,9 +645,9 @@ fn close_lane(id: u64) {
     };
     lane.closed = true;
     lane.unsubmitted.clear();
-    lane.reads.clear();
-    lane.statuses.clear(); // releases their arrays
-    while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
+    let pending =
+        |l: &Lane| !(l.reads.is_empty() && l.running.is_empty() && l.statuses.is_empty());
+    while lanes.lanes.get(&id).is_some_and(pending) {
         lanes = scheduler
             .finished
             .wait(lanes)
@@ -783,9 +784,10 @@ extern "system" fn submit(this: QueueRef) {
     scheduler.work.notify_all();
 }
 
-/// Ends the queue whatever its reference count: what was not started never
-/// completes, and this returns once the reads already running have
-/// finished. Grand Theft Auto VI calls this, not `Release`.
+/// Ends the queue whatever its reference count: what was not submitted
+/// never completes, and this returns once everything submitted has
+/// completed or failed (a title may still be polling its status entries).
+/// Grand Theft Auto VI calls this, not `Release`.
 extern "system" fn close(this: QueueRef) {
     // SAFETY: as above.
     close_lane(unsafe { &*this }.state.id);
@@ -1448,6 +1450,26 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(result(array, 0), E_PENDING);
         assert_eq!(out, [0; 16]);
+    }
+
+    /// Close blocks until every submitted request has completed or failed,
+    /// and writes their status entries.
+    #[test]
+    fn closing_a_queue_completes_what_was_submitted() {
+        let data = pattern(8 << 20);
+        let (_dir, file) = file_with(&data);
+        let (queue, array) = (new_queue(0), status_array(1));
+        let chunk = 256 << 10;
+        let mut out = vec![0u8; data.len()];
+        for k in 0..32 {
+            let dst = out[k * chunk..].as_mut_ptr().cast();
+            enqueue(queue, &request(0, dst, chunk, file, (k * chunk) as u64, chunk));
+        }
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        void(queue, 0x40);
+        assert_eq!(result(array, 0), S_OK);
+        assert!(out == data);
     }
 
     #[test]
