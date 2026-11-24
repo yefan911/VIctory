@@ -111,6 +111,57 @@ extern "system" fn security_info_result(
     )
 }
 
+/// A tag of its own: a UTF-16 call can never be mistaken for an ANSI one,
+/// so a result begun for the one is refused by the other's result slot.
+static SECURITY_UTF16: u8 = 0;
+
+/// The title's NUL-terminated UTF-16 string, if any.
+fn wide(s: *const u16) -> Option<String> {
+    (!s.is_null()).then(|| {
+        // SAFETY: the title passes a NUL-terminated string or null.
+        unsafe {
+            let len = (0..).take_while(|&i| *s.add(i) != 0).count();
+            String::from_utf16_lossy(std::slice::from_raw_parts(s, len))
+        }
+    })
+}
+
+/// The same allow list, asked for by a UTF-16 URL: unreachable offline.
+extern "system" fn security_info_utf16_async(
+    _: This,
+    url: *const u16,
+    block: *mut AsyncBlock,
+) -> HRESULT {
+    tracing::debug!(
+        url = wide(url).unwrap_or_default(),
+        "security information (utf16): offline"
+    );
+    xasync::finished(block, (&raw const SECURITY_UTF16).cast(), UNREACHABLE)
+}
+extern "system" fn security_info_utf16_size(
+    _: This,
+    block: *mut AsyncBlock,
+    out: *mut usize,
+) -> HRESULT {
+    xasync::XAsyncGetResultSize(block, out)
+}
+extern "system" fn security_info_utf16_result(
+    _: This,
+    block: *mut AsyncBlock,
+    size: usize,
+    used: *mut usize,
+    buffer: *mut u8,
+    _info: *mut *const c_void,
+) -> HRESULT {
+    xasync::XAsyncGetResult(
+        block,
+        (&raw const SECURITY_UTF16).cast(),
+        size,
+        buffer.cast(),
+        used,
+    )
+}
+
 /// No security information can exist offline, so no certificate passes.
 extern "system" fn verify_certificate(
     _: This,
@@ -124,7 +175,8 @@ extern "system" fn connectivity_hint(_: This, out: *mut ConnectivityHint) -> HRE
     put(out, OFFLINE)
 }
 
-/// The hint never changes offline, so the callback never runs.
+/// Nothing the service reports ever changes offline (the connectivity
+/// hint no more than the preferred UDP port), so the callback never runs.
 extern "system" fn register(
     _: This,
     _queue: *const c_void,
@@ -134,6 +186,7 @@ extern "system" fn register(
 ) -> HRESULT {
     put(out, token())
 }
+/// Nothing was ever raised, so any token is as good as another.
 extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
     true
 }
@@ -142,26 +195,27 @@ static VTABLE: Methods<18> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    udp_port as *const (),             // 0x18
-    udp_port_async as *const (),       // 0x20
-    udp_port_result as *const (),      // 0x28
-    missing::<6> as *const (),         // 0x30 port changed
-    missing::<7> as *const (),         // 0x38
-    security_info_async as *const (),  // 0x40
-    security_info_size as *const (),   // 0x48
-    security_info_result as *const (), // 0x50
-    missing::<11> as *const (),        // 0x58 the same for UTF-16 URLs
-    missing::<12> as *const (),        // 0x60
-    missing::<13> as *const (),        // 0x68
-    verify_certificate as *const (),   // 0x70
-    connectivity_hint as *const (),    // 0x78
-    register as *const (),             // 0x80 hint changed (never)
-    unregister as *const (),           // 0x88
+    udp_port as *const (),                   // 0x18
+    udp_port_async as *const (),             // 0x20
+    udp_port_result as *const (),            // 0x28
+    register as *const (),                   // 0x30 port changed (never)
+    unregister as *const (),                 // 0x38
+    security_info_async as *const (),        // 0x40
+    security_info_size as *const (),         // 0x48
+    security_info_result as *const (),       // 0x50
+    security_info_utf16_async as *const (),  // 0x58 the same for UTF-16 URLs
+    security_info_utf16_size as *const (),   // 0x60
+    security_info_utf16_result as *const (), // 0x68
+    verify_certificate as *const (),         // 0x70
+    connectivity_hint as *const (),          // 0x78
+    register as *const (),                   // 0x80 hint changed (never)
+    unregister as *const (),                 // 0x88
 ]);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modules::xasync::E_INVALIDARG;
     use crate::modules::xgameruntime::{S_OK, method};
 
     fn block() -> AsyncBlock {
@@ -206,5 +260,169 @@ mod tests {
             method::<Size>(&OBJECT, 0x48)(this, &mut b, &mut size),
             UNREACHABLE
         );
+    }
+
+    /// The preferred UDP port never changes offline, but registering for it
+    /// still hands out a token, as the connectivity hint's slot does.
+    #[test]
+    fn a_port_change_callback_registers_but_never_runs() {
+        let this: This = &OBJECT;
+        type Register = extern "system" fn(
+            This,
+            *const c_void,
+            *mut c_void,
+            *const c_void,
+            *mut u64,
+        ) -> HRESULT;
+        type Unregister = extern "system" fn(This, u64, bool) -> bool;
+        let (queue, context, callback) = (std::ptr::null(), std::ptr::null_mut(), std::ptr::null());
+
+        let mut first = 0;
+        assert_eq!(
+            method::<Register>(&OBJECT, 0x30)(this, queue, context, callback, &mut first),
+            S_OK
+        );
+        assert_ne!(first, 0, "a token titles can keep");
+        let mut second = 0;
+        assert_eq!(
+            method::<Register>(&OBJECT, 0x30)(this, queue, context, callback, &mut second),
+            S_OK
+        );
+        assert_ne!(second, first, "a token of its own per registration");
+        assert_eq!(
+            method::<Register>(&OBJECT, 0x30)(this, queue, context, callback, std::ptr::null_mut()),
+            E_INVALIDARG
+        );
+
+        assert!(method::<Unregister>(&OBJECT, 0x38)(this, first, true));
+        assert!(
+            method::<Unregister>(&OBJECT, 0x38)(this, 0, false),
+            "nothing was ever raised, so any token unregisters"
+        );
+    }
+
+    /// The UTF-16 siblings answer as the ANSI trio does: nothing to report,
+    /// and nothing to read back.
+    #[test]
+    fn utf16_security_information_is_unreachable_offline() {
+        let this: This = &OBJECT;
+        type Begin = extern "system" fn(This, *const u16, *mut AsyncBlock) -> HRESULT;
+        type Size = extern "system" fn(This, *mut AsyncBlock, *mut usize) -> HRESULT;
+        type Result = extern "system" fn(
+            This,
+            *mut AsyncBlock,
+            usize,
+            *mut usize,
+            *mut u8,
+            *mut *const c_void,
+        ) -> HRESULT;
+
+        let url: Vec<u16> = "https://example.invalid/\0".encode_utf16().collect();
+        let mut b = block();
+        assert_eq!(
+            method::<Begin>(&OBJECT, 0x58)(this, url.as_ptr(), &mut b),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), UNREACHABLE);
+        let mut size = 0;
+        assert_eq!(
+            method::<Size>(&OBJECT, 0x60)(this, &mut b, &mut size),
+            UNREACHABLE
+        );
+        assert_eq!(size, 0, "a failed call has no size to report");
+        let mut buffer = [0u8; 64];
+        let mut used = 0;
+        let mut info: *const c_void = std::ptr::null();
+        assert_eq!(
+            method::<Result>(&OBJECT, 0x68)(
+                this,
+                &mut b,
+                buffer.len(),
+                &mut used,
+                buffer.as_mut_ptr(),
+                &mut info,
+            ),
+            UNREACHABLE
+        );
+        assert_eq!(used, 0, "and no bytes were used");
+        // The ANSI slot reads a failed call the same way: the status is all
+        // there is, so which slot began it never comes into it.
+        assert_eq!(
+            method::<Result>(&OBJECT, 0x50)(
+                this,
+                &mut b,
+                0,
+                &mut used,
+                std::ptr::null_mut(),
+                &mut info,
+            ),
+            UNREACHABLE
+        );
+    }
+
+    /// A null URL is logged as an empty one, not read through.
+    #[test]
+    fn a_null_utf16_url_completes_like_an_empty_one() {
+        let this: This = &OBJECT;
+        type Begin = extern "system" fn(This, *const u16, *mut AsyncBlock) -> HRESULT;
+        let mut b = block();
+        assert_eq!(
+            method::<Begin>(&OBJECT, 0x58)(this, std::ptr::null(), &mut b),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), UNREACHABLE);
+    }
+
+    /// Each trio tags its calls with an identity of its own, so a result
+    /// begun for one is refused by the other's result slot. Offline a call
+    /// ends with an error and no result, which `XAsyncGetResult` reports
+    /// before it ever looks at the tag; this stands in with a call that
+    /// does carry one, so that the tags themselves are what is under test.
+    #[test]
+    fn utf16_and_ansi_results_are_not_interchangeable() {
+        let this: This = &OBJECT;
+        type Result = extern "system" fn(
+            This,
+            *mut AsyncBlock,
+            usize,
+            *mut usize,
+            *mut u8,
+            *mut *const c_void,
+        ) -> HRESULT;
+
+        let mut b = block();
+        let identity = (&raw const SECURITY_UTF16).cast();
+        assert_eq!(
+            xasync::finished_with(&mut b, identity, Ok(vec![0xAB; 4])),
+            S_OK
+        );
+        let mut info: *const c_void = std::ptr::null();
+        let mut used = 0;
+        let mut ansi = [0u8; 4];
+        assert_eq!(
+            method::<Result>(&OBJECT, 0x50)(
+                this,
+                &mut b,
+                4,
+                &mut used,
+                ansi.as_mut_ptr(),
+                &mut info,
+            ),
+            E_INVALIDARG
+        );
+        assert_eq!(ansi, [0; 4], "and nothing was written through it");
+        let mut utf16 = [0u8; 4];
+        assert_eq!(
+            method::<Result>(&OBJECT, 0x68)(
+                this,
+                &mut b,
+                4,
+                &mut used,
+                utf16.as_mut_ptr(),
+                &mut info,
+            ),
+            S_OK
+        );
+        assert_eq!((utf16, used), ([0xAB; 4], 4));
     }
 }
