@@ -80,16 +80,12 @@ fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
     let mut rest = Vec::new();
     loop {
         match std::fs::canonicalize(existing) {
-            Ok(canon) => {
-                let mut out = canon;
-                for component in rest.iter().rev() {
-                    out.push(component);
-                }
-                return Ok(normalize(&out));
-            }
-            Err(source) => match (existing.parent(), existing.file_name()) {
-                (Some(parent), Some(name)) => {
-                    rest.push(name.to_os_string());
+            Ok(canon) => return Ok(append_tail(canon, rest.iter().rev())),
+            // The last component, not `file_name`: that is `None` for `..`,
+            // which a path may well hold below a directory not created yet.
+            Err(source) => match (existing.parent(), existing.components().next_back()) {
+                (Some(parent), Some(name @ (Component::Normal(_) | Component::ParentDir))) => {
+                    rest.push(name.as_os_str().to_os_string());
                     existing = parent;
                 }
                 _ => {
@@ -103,16 +99,29 @@ fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
     }
 }
 
-/// Removes `.` and resolves `..` lexically (only used on the non-existing tail).
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            c => out.push(c),
+/// Appends the components of a tail that did not resolve to the canonical
+/// path `out`, one at a time.
+///
+/// A tail fails to resolve as a whole as soon as one of its directories is
+/// missing, yet past a `..` it can name existing paths again:
+/// `missing/../link/out` is `link/out` once `missing` is created (which
+/// `create_dir_all` does), and `link` may be a symlink into the source tree.
+/// Normalizing the tail lexically never looked at `link` and accepted the
+/// path. So `..` drops the last component (one that does not exist, or the
+/// canonical prefix, which holds no symlinks), and after every name that
+/// exists the path is canonicalized again, following any symlink there.
+fn append_tail<'a>(
+    mut out: PathBuf,
+    tail: impl IntoIterator<Item = &'a std::ffi::OsString>,
+) -> PathBuf {
+    for component in tail {
+        if component == Component::ParentDir.as_os_str() {
+            out.pop();
+            continue;
+        }
+        out.push(component);
+        if let Ok(canon) = std::fs::canonicalize(&out) {
+            out = canon;
         }
     }
     out
@@ -121,6 +130,35 @@ fn normalize(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A temporary directory outside every VIctory source tree.
+    ///
+    /// `tempfile::tempdir()` alone follows `TMPDIR`, and with `TMPDIR` inside
+    /// the checkout (a scratch directory there is common) every directory it
+    /// makes is inside the repository: the tests that need an outside
+    /// directory then fail, and the marker test passes without the marker
+    /// mattering. So `TMPDIR` is used only when it is outside; otherwise the
+    /// nearest writable ancestor of the checkout that is outside, and failing
+    /// that the test says what to do instead of failing on a misleading
+    /// `InsideRepo`.
+    fn outside_tempdir() -> tempfile::TempDir {
+        let root = std::fs::canonicalize(compiled_workspace_root()).unwrap();
+        let candidates = std::iter::once(std::env::temp_dir())
+            .chain(root.ancestors().skip(1).map(Path::to_path_buf));
+        for dir in candidates {
+            let Ok(tmp) = tempfile::tempdir_in(&dir) else {
+                continue;
+            };
+            if ensure_outside_repo(tmp.path()).is_ok() {
+                return tmp;
+            }
+        }
+        panic!(
+            "no writable temporary directory outside the source tree ({}); \
+             set TMPDIR to one",
+            root.display()
+        );
+    }
 
     #[test]
     fn rejects_paths_inside_this_repo() {
@@ -145,15 +183,73 @@ mod tests {
     }
 
     #[test]
+    fn resolves_dotdot_after_a_missing_directory() {
+        // `Path::file_name` is `None` for a path ending in `..`, so the walk
+        // up to an existing prefix has to keep that component too.
+        let tmp = outside_tempdir();
+        let path = tmp.path().join("missing").join("..").join("cache");
+        ensure_outside_repo(&path).unwrap();
+
+        let inside = compiled_workspace_root()
+            .join("not-yet-created")
+            .join("..")
+            .join("out");
+        assert!(matches!(
+            ensure_outside_repo(&inside),
+            Err(PolicyError::InsideRepo { .. })
+        ));
+    }
+
+    /// `missing/../link/out` resolves to `link/out` once `missing` exists,
+    /// and `link` here leads into a directory of another source tree. The
+    /// tail after the missing directory used to be normalized lexically, so
+    /// the symlink was never followed, no ancestor of the unresolved path
+    /// held the marker, and the path was accepted.
+    #[cfg(unix)]
+    #[test]
+    fn follows_symlinks_named_after_a_missing_directory() {
+        let tree = outside_tempdir();
+        std::fs::write(tree.path().join(ROOT_MARKER), "").unwrap();
+        let cache = tree.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let tmp = outside_tempdir();
+        std::os::unix::fs::symlink(&cache, tmp.path().join("link")).unwrap();
+
+        let path = tmp
+            .path()
+            .join("missing")
+            .join("..")
+            .join("link")
+            .join("out");
+        assert!(matches!(
+            ensure_outside_repo(&path),
+            Err(PolicyError::InsideRepo { .. })
+        ));
+        // And that is where a write to it lands.
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(cache.join("out").is_dir());
+
+        // `..` after a missing directory still steps out of it lexically.
+        let path = tmp.path().join("missing").join("..").join("cache");
+        ensure_outside_repo(&path).unwrap();
+    }
+
+    #[test]
     fn rejects_other_clones_via_marker() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = outside_tempdir();
+        // Accepted before the marker is written, so the marker is what
+        // makes the difference.
+        ensure_outside_repo(&tmp.path().join("cache")).unwrap();
         std::fs::write(tmp.path().join(ROOT_MARKER), "").unwrap();
-        assert!(ensure_outside_repo(&tmp.path().join("cache")).is_err());
+        assert!(matches!(
+            ensure_outside_repo(&tmp.path().join("cache")),
+            Err(PolicyError::InsideRepo { .. })
+        ));
     }
 
     #[test]
     fn accepts_unrelated_directories() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = outside_tempdir();
         ensure_outside_repo(&tmp.path().join("does").join("not").join("exist")).unwrap();
     }
 }

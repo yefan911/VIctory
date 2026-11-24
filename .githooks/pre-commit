@@ -1,3 +1,22 @@
 #!/bin/sh
 # Enforces the asset policy on every commit. Install with: cargo xtask install-hooks
-exec cargo xtask policy --staged
+#
+# Git clients started from a desktop launcher (IDEs, GUI git tools) often run
+# hooks with a PATH that lacks ~/.cargo/bin, where rustup installs cargo; the
+# hook then failed with only "cargo: not found". Cargo is looked for there
+# too, and if it is nowhere the commit is refused with a message saying so.
+cargo=$(command -v cargo)
+if [ -z "$cargo" ]; then
+	for candidate in "${CARGO_HOME:-$HOME/.cargo}/bin/cargo" "${CARGO_HOME:-$HOME/.cargo}/bin/cargo.exe"; do
+		if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+			cargo=$candidate
+			break
+		fi
+	done
+fi
+if [ -z "$cargo" ]; then
+	echo "asset policy: cargo not found on PATH or in ${CARGO_HOME:-$HOME/.cargo}/bin;" >&2
+	echo "asset policy: add it to the PATH git runs hooks with, or set CARGO_HOME" >&2
+	exit 1
+fi
+exec "$cargo" xtask policy --staged

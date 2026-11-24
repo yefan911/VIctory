@@ -43,13 +43,36 @@ user's dump), `test_titles`, and `cache_dir` for everything derived
 ## Enforcement
 
 1. `.gitignore` keeps common data types out of `git status`.
-2. `cargo xtask policy` (run by the pre-commit hook; install with
-   `cargo xtask install-hooks`) is an allowlist: files must have an allowed
-   type, be under 512 KiB, contain no binary data or known binary
-   signatures, and hold no long hex/base64 runs. Exceptions need an entry
-   with a reason in `xtask/src/policy.rs`.
+2. `cargo xtask policy` (run by the `pre-commit` hook, and by
+   `pre-merge-commit` and `pre-applypatch`, which `git merge` and `git am`
+   run instead of it; install with `cargo xtask install-hooks`) is an
+   allowlist: files must have an allowed
+   type, be under 512 KiB (a bigger file is refused after reading its
+   first 512 KiB only, so a multi-gigabyte dump is never held in memory), be UTF-8 text without control characters
+   (so binary data with its NUL bytes stuffed away is still refused),
+   contain no known binary signatures, and hold no long hex/base64 runs, base64url (`-`, `_`) included (a run
+   wrapped onto several lines, as `base64` writes it, is one run), no long
+   runs without whitespace (ascii85, Z85, uuencode, and base32768 or
+   base65536 in any script), and no long
+   numeric arrays or `\xHH` / `\u{..}` / `\uHHHH` / octal escape strings (`xxd -i` output;
+   a string of escapes split into many literals, by `\` continuations,
+   adjacent literals or commas, is one string; tables over 512
+   entries are split into rows), nor hex dumps (`xxd`, `hexdump -C`,
+   `od`: lines of short hex groups, offsets and all). File names must
+   be UTF-8, and submodules, like untracked git repositories nested in the
+   checkout, are refused. A symlink is checked as git stores it, as
+   its target path. A tracked file is checked as the index holds it as
+   well as on disk, so editing or hiding the working copy
+   (`--assume-unchanged`, `--skip-worktree`) does not hide what is
+   committed. Git LFS pointers are refused: what they stand for is
+   stored outside the repository, where no check reads it. Exceptions need
+   an entry with a reason in `xtask/src/policy.rs`, pinned to the BLAKE3 of
+   the exempted content: any other content at that path is refused, so a
+   new version needs the entry updated.
 3. At runtime, everything that writes derived data calls
-   `victory_core::ensure_outside_repo`.
+   `victory_core::ensure_outside_repo`. It resolves the destination as a
+   write to it would, symlinks included, even past a directory that does
+   not exist yet (`missing/../link/out`).
 4. Tests that need real files take their paths from environment variables
    and skip when unset. They assert on properties, never on snapshots.
 

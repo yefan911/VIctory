@@ -1,0 +1,5 @@
+#!/bin/sh
+# `git merge` runs this hook, not pre-commit, before it records a merge it
+# made without conflicts; the merged files are staged. Same check, so the
+# same hook (git runs hooks by path, from the top of the worktree).
+case $0 in */*) exec "${0%/*}/pre-commit" ;; *) exec ./pre-commit ;; esac

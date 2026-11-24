@@ -1,0 +1,5 @@
+#!/bin/sh
+# `git am` runs this hook, not pre-commit, once a mailed patch is applied to
+# the index and before it is committed. Same check, so the same hook (git
+# runs hooks by path, from the top of the worktree).
+case $0 in */*) exec "${0%/*}/pre-commit" ;; *) exec ./pre-commit ;; esac
