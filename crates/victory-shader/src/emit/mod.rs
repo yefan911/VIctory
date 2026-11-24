@@ -488,10 +488,15 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
         let mask = *part
             .get(at + 24)
             .ok_or(ShaderError::Malformed("truncated"))?;
-        if u32_at(part, at + 28)? != 0 {
+        // DXBC encodes HLSL min16*/min10* types with a 32-bit ComponentType
+        // (1..=3) and a non-zero D3D_MIN_PRECISION at +28 (1 FLOAT_16,
+        // 2 FLOAT_2_8, 4 SINT_16, 5 UINT_16, 240 ANY_16, 241 ANY_10).
+        // DXIL declares them as 32-bit with MinPrecision = 0.
+        let min_prec = u32_at(part, at + 28)?;
+        if !matches!(min_prec, 0 | 1 | 2 | 4 | 5 | 240 | 241) {
             return Err(ShaderError::Unsupported {
                 offset: 0,
-                what: "a minimum-precision signature element",
+                what: "an unknown minimum-precision signature element",
             });
         }
         if u32_at(part, at)? != 0 {
@@ -1156,5 +1161,48 @@ mod tests {
         let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    #[test]
+    fn signature_accepts_known_min_precision_and_rejects_unknown() {
+        let base = SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        for (min_prec, comp_type, expected_comp) in [
+            (1u32, 3u32, 9u8), // D3D_MIN_PRECISION_FLOAT_16
+            (2, 3, 9),         // D3D_MIN_PRECISION_FLOAT_2_8
+            (4, 2, 4),         // D3D_MIN_PRECISION_SINT_16
+            (5, 1, 5),         // D3D_MIN_PRECISION_UINT_16
+            (240, 3, 9),       // D3D_MIN_PRECISION_ANY_16
+            (241, 3, 9),       // D3D_MIN_PRECISION_ANY_10
+        ] {
+            let mut part = super::container::signature(std::slice::from_ref(&base), true);
+            // Row starts at offset 8: +16 is ComponentType, +28 is MinPrecision.
+            part[8 + 16..8 + 20].copy_from_slice(&comp_type.to_le_bytes());
+            part[8 + 28..8 + 32].copy_from_slice(&min_prec.to_le_bytes());
+            let parsed = super::signature(&part).unwrap();
+            assert_eq!(parsed.len(), 1);
+            assert_eq!(parsed[0].comp, expected_comp);
+            assert!(!parsed[0].half);
+        }
+
+        let mut bad = super::container::signature(&[base], true);
+        bad[8 + 28..8 + 32].copy_from_slice(&3u32.to_le_bytes());
+        assert_eq!(
+            super::signature(&bad),
+            Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "an unknown minimum-precision signature element",
+            })
+        );
     }
 }
