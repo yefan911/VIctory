@@ -315,3 +315,41 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
         }
     }
 }
+
+#[test]
+fn packed_buffer_load_keeps_unwritten_high_half() {
+    let data = [1.0f32, 2.0, 3.0, 4.0].map(f32::to_bits);
+    let buffer = || View::Buffer {
+        data: &data,
+        stride: Stride::Typed,
+    };
+    let views = [buffer(), buffer(), View::RawUav(32)];
+    for (opcode, reg, seed, want) in [
+        (0, 12, 0x5a5a_1234, 0x5a5a_3c00),
+        (1, 12, 0x5a5a_1234, 0x4000_3c00),
+        (2, 13, 0xdead_5678, 0xdead_4200),
+    ] {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xF408_0302,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[4:5], 0
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E00_02FF | reg << 17,
+            seed, // v_mov_b32 v[reg], seed
+            0xE200_2000 | opcode << 18,
+            0x8003_0C02, // buffer_load_format_d16_* v12..., v2, s[12:15], 0 idxen
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0xE070_1000,
+            0x800A_0010 | reg << 8, // buffer_store_dword v[reg], v16, s[40:43], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let results = run(&build_with_handle_count(&words, true, 0), &views);
+        assert!(!results.is_empty(), "no SM 6.6 test adapter");
+        for (backend, got) in results {
+            assert_eq!(got, [want; 32], "{backend}: {} channels", opcode + 1);
+        }
+    }
+}

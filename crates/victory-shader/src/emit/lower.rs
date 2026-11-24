@@ -9009,7 +9009,7 @@ impl<'a> Lower<'a> {
             return Err("a buffer result");
         };
         if d16 {
-            // Two f16 channels per VGPR (an odd last high half 0).
+            // Two f16 channels per VGPR. An odd last channel leaves its high half intact.
             let k16 = self.s.m.i32(16);
             let i32t = self.s.t.i32;
             for k in 0..count.div_ceil(2) {
@@ -9027,7 +9027,12 @@ impl<'a> Lower<'a> {
                         None => h,
                     });
                 }
-                self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
+                let reg = reg + k as u8;
+                let mut x = x.expect("a channel");
+                if 2 * k + 1 == count {
+                    x = self.low_half(inst, reg, x);
+                }
+                self.write(inst, Reg::V(reg), x, guard);
             }
             return Ok(());
         }
