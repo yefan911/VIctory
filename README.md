@@ -62,6 +62,13 @@ Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
 
+Keep the game folder on an SSD if you can. From a hard drive the first
+screen stays black, at 30 fps and about 3 draws/frame, for a minute and a
+half or more while the title reads its files: the drive stays 100% busy with
+small random reads, and nothing shows until they finish. Wait for it rather
+than closing the window. A later launch is faster while Windows still holds
+the files in its cache.
+
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)
