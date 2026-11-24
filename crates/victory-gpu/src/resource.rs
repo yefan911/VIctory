@@ -252,7 +252,7 @@ pub(crate) fn family(format: u32) -> u32 {
         (44, 47),
         (48, 52),
         (53, 59),
-        (60, 65),
+        (60, 64),
         (70, 72),
         (73, 75),
         (76, 78),
@@ -1872,6 +1872,22 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn a8_unorm_is_not_in_the_r8_typeless_family() {
+        // DXGI_FORMAT values: 60 R8_TYPELESS, 61 R8_UNORM, 62 R8_UINT,
+        // 63 R8_SNORM, 64 R8_SINT, 65 A8_UNORM. The R8 typeless family is
+        // 60..=64; A8_UNORM has no typeless family and cannot be cast to R8,
+        // so it must stand alone rather than fold into R8_TYPELESS.
+        assert_eq!(family(60), 60);
+        for f in 61..=64 {
+            assert_eq!(family(f), 60);
+        }
+        assert_eq!(family(65), 65);
+        // Boundaries: 59 belongs to the preceding family, 66 is unmapped.
+        assert_eq!(family(59), 53);
+        assert_eq!(family(66), 66);
+    }
 
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;
