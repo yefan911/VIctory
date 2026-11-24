@@ -132,8 +132,24 @@ const PACKET_RSRC1: usize = 0x14;
 const PACKET_RSRC2: usize = 0x18;
 const FSPX_RECORDS: usize = 0x18;
 const FSPX_RECORD: usize = 32;
-/// Unpacked blobs are a few KiB; refuse to allocate for absurd sizes.
-const MAX_UNPACKED: u64 = 16 << 20;
+/// What the native blobs of one part may unpack to, plus the code and raw
+/// table bytes read out of them, in all. Unpacked blobs are a few KiB;
+/// refuse to allocate for absurd sizes.
+const MAX_PART_BYTES: usize = 16 << 20;
+
+/// Bytes the native blobs of one part may still unpack to and have read out
+/// of them as code and root tables, together: index entries may name one
+/// blob many times, and a blob's stages one range of it.
+struct PartBudget(usize);
+
+impl PartBudget {
+    /// Takes `bytes` off what is left; refuses when they are not left.
+    fn take(&mut self, bytes: usize) -> Result<(), ShaderError> {
+        let left = self.0.checked_sub(bytes);
+        self.0 = left.ok_or(Malformed("implausible size of a part's native blobs"))?;
+        Ok(())
+    }
+}
 
 /// Hardware shader stage a native program runs as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -435,6 +451,7 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         return Err(Malformed("implausible XDAT entry count"));
     }
     let mut out = Vec::new();
+    let mut budget = PartBudget(MAX_PART_BYTES);
     for i in 0..count {
         let at = XDAT_OFFSET + 12 + 12 * i;
         if u32_at(part, at)? != KIND_NATIVE {
@@ -443,7 +460,7 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         let offset = u32_at(part, at + 4)?.into();
         let size = u32_at(part, at + 8)?.into();
         let blob = bytes(part, offset, size).ok_or(Malformed("XDAT entry out of bounds"))?;
-        out.extend(programs(&unpack(blob)?)?);
+        out.extend(programs(&unpack(blob, &mut budget)?, &mut budget)?);
     }
     Ok(out)
 }
@@ -565,7 +582,8 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     })
 }
 
-fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
+/// The blob's contents; their size comes off `budget` before they inflate.
+fn unpack(blob: &[u8], budget: &mut PartBudget) -> Result<Vec<u8>, ShaderError> {
     if blob.get(0..4) != Some(b"XBCH") {
         return Err(Malformed("native blob lacks XBCH magic"));
     }
@@ -573,21 +591,22 @@ fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
         return Err(Malformed("unknown XBCH version"));
     }
     let packed = u64_at(blob, 8)?;
-    let unpacked = u64_at(blob, 16)?;
-    if unpacked > MAX_UNPACKED {
-        return Err(Malformed("implausible XBCH unpacked size"));
-    }
+    // A size past `usize` fits no budget.
+    let unpacked = usize::try_from(u64_at(blob, 16)?).unwrap_or(usize::MAX);
+    budget.take(unpacked)?;
     let stream =
         bytes(blob, XBCH_HEADER as u64, packed).ok_or(Malformed("XBCH stream out of bounds"))?;
-    let out = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(stream, unpacked as usize)
+    let out = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(stream, unpacked)
         .map_err(|_| Malformed("XBCH stream does not inflate to its stated size"))?;
-    if out.len() as u64 != unpacked {
+    if out.len() != unpacked {
         return Err(Malformed("XBCH stream does not inflate to its stated size"));
     }
     Ok(out)
 }
 
-fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
+/// The programs of an unpacked blob; the code and raw table bytes read out
+/// of it come off `budget`.
+fn programs(fssm: &[u8], budget: &mut PartBudget) -> Result<Vec<NativeProgram>, ShaderError> {
     if fssm.get(0..4) != Some(b"FSSM") {
         return Err(Malformed("native blob lacks FSSM magic"));
     }
@@ -623,7 +642,10 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
             bytes(payload, u64_at(record, at)?, len)
                 .ok_or(Malformed("FSSM root table out of bounds"))
         };
-        let layout = table(RECORD_LAYOUT, RECORD_COUNTS)?
+        let layout = table(RECORD_LAYOUT, RECORD_COUNTS)?;
+        let used = table(RECORD_USED, RECORD_COUNTS + 4)?;
+        budget.take(code.len() + layout.len() + used.len())?;
+        let layout = layout
             .as_chunks::<{ ENTRY_SIZE as usize }>()
             .0
             .iter()
@@ -636,7 +658,7 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 slot: e[17],
             })
             .collect();
-        let used = table(RECORD_USED, RECORD_COUNTS + 4)?
+        let used = used
             .as_chunks::<{ ENTRY_SIZE as usize }>()
             .0
             .iter()
@@ -1200,6 +1222,75 @@ pub(crate) mod tests {
             .map(|p| p.stage)
             .collect();
         assert_eq!(stages, [HwStage::Es, HwStage::Vs]);
+    }
+
+    #[test]
+    fn code_comes_off_the_size_budget() {
+        // 5 MiB of code costs 5 MiB unpacked and 5 MiB kept: one such blob
+        // fits the part's 16 MiB, the second one's code no longer does.
+        let code = vec![0u8; 5 << 20];
+        let native = xbch(&fssm(&[(HwStage::Ls, &code)]));
+        let entry = (KIND_NATIVE, &native[..]);
+        let one = native_programs(&part(&[entry])).unwrap();
+        assert_eq!(one[0].code.len(), 5 << 20);
+        assert_eq!(
+            native_programs(&part(&[entry, entry])).err(),
+            Some(Malformed("implausible size of a part's native blobs"))
+        );
+    }
+
+    #[test]
+    fn root_tables_come_off_the_size_budget() {
+        // 6 MB of zero entries after an empty program: the blob and its
+        // layout table fit the part's 16 MiB, the used table over the same
+        // bytes no longer does.
+        const ENTRIES: u32 = 300_000;
+        let mut blob = fssm(&[(HwStage::Ls, &[])]);
+        let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(HwStage::Ls)).unwrap() as usize;
+        let tables = (blob.len() - FSSM_HEADER) as u64;
+        blob.resize(blob.len() + ENTRIES as usize * ENTRY_SIZE as usize, 0);
+        let payload = (blob.len() - FSSM_HEADER) as u64;
+        blob[8..16].copy_from_slice(&payload.to_le_bytes());
+        blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&tables.to_le_bytes());
+        blob[record + RECORD_USED..][..8].copy_from_slice(&tables.to_le_bytes());
+        blob[record + RECORD_COUNTS..][..4].copy_from_slice(&ENTRIES.to_le_bytes());
+        let found = native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap();
+        assert_eq!(found[0].layout.len(), 300_000);
+
+        blob[record + RECORD_COUNTS + 4..][..4].copy_from_slice(&ENTRIES.to_le_bytes());
+        assert_eq!(
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).err(),
+            Some(Malformed("implausible size of a part's native blobs"))
+        );
+    }
+
+    #[test]
+    fn unpacked_blobs_come_off_the_size_budget() {
+        // A 5 MiB blob whose program keeps nothing: three fit the part's
+        // 16 MiB, the fourth is not unpacked.
+        let mut blob = fssm(&[(HwStage::Ls, &vec![0u8; 5 << 20])]);
+        let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(HwStage::Ls)).unwrap() as usize;
+        blob[record + 8..][..8].copy_from_slice(&0u64.to_le_bytes());
+        let native = xbch(&blob);
+        let entry = (KIND_NATIVE, &native[..]);
+        assert_eq!(native_programs(&part(&[entry; 3])).unwrap().len(), 3);
+        assert_eq!(
+            native_programs(&part(&[entry; 4])).err(),
+            Some(Malformed("implausible size of a part's native blobs"))
+        );
+    }
+
+    #[test]
+    fn an_oversized_blob_is_refused_before_it_inflates() {
+        // One byte more than a part may unpack to, stated over a stream that
+        // is no zlib stream: the size is refused, the stream is not read.
+        let mut blob = xbch(&fssm(&[(HwStage::Ls, &VS_CODE)]));
+        blob[16..24].copy_from_slice(&((16u64 << 20) + 1).to_le_bytes());
+        blob[XBCH_HEADER + 2] = 0xFF;
+        assert_eq!(
+            native_programs(&part(&[(KIND_NATIVE, &blob)])).err(),
+            Some(Malformed("implausible size of a part's native blobs"))
+        );
     }
 
     #[test]
