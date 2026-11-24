@@ -142,9 +142,11 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
         f64::from(aw) / f64::from(width),
         f64::from(ah) / f64::from(height),
     );
+    // A very small work area can scale a positive requested dimension below
+    // one pixel, which truncates to zero. A window still needs a pixel there.
     (
-        (f64::from(width) * scale) as i32,
-        (f64::from(height) * scale) as i32,
+        ((f64::from(width) * scale) as i32).max(1),
+        ((f64::from(height) * scale) as i32).max(1),
     )
 }
 
@@ -345,6 +347,16 @@ mod tests {
             fit_into(&area, wm::CW_USEDEFAULT, 0),
             (wm::CW_USEDEFAULT, 0)
         );
+
+        // A tiny work area must not round a positive size down to zero.
+        let tiny = RECT {
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 100,
+        };
+        assert_eq!(fit_into(&tiny, 1000, 100), (1, 1));
+        assert_eq!(fit_into(&area, 0, -5), (0, -5));
     }
 
     #[test]
