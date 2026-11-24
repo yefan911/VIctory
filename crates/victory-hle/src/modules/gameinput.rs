@@ -343,6 +343,11 @@ struct Event {
     previous: u32,
 }
 
+struct Enumeration {
+    registration: Registration,
+    hotplug: Vec<Event>,
+}
+
 #[derive(Default)]
 struct Slot {
     connected: bool,
@@ -353,10 +358,17 @@ struct Slot {
 struct State {
     slots: [Slot; DEVICES],
     callbacks: Vec<Registration>,
+    /// Blocking enumerations running outside the queue. Polls record their
+    /// hotplug events here but cannot deliver them until enumeration ends.
+    enumerating: Vec<Enumeration>,
     /// Asynchronous enumerations, delivered by the next poll.
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// Events waiting for the single delivery loop.
+    queue: VecDeque<Event>,
+    /// One thread drains `queue`; other producers only append to it.
+    delivering: bool,
 }
 
 pub struct Hub {
@@ -399,8 +411,11 @@ impl Hub {
             state: Mutex::new(State {
                 slots: Default::default(),
                 callbacks: Vec::new(),
+                enumerating: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                queue: VecDeque::new(),
+                delivering: false,
             }),
             returned: Condvar::new(),
         }));
@@ -431,7 +446,7 @@ impl Hub {
         lock(&self.state)
     }
 
-    /// Reads the host once; device callbacks run on the calling thread.
+    /// Reads the host once and queues its device callbacks.
     fn poll(&self) {
         let (pads, keys) = {
             let mut source = lock(&self.source);
@@ -445,38 +460,64 @@ impl Hub {
             let _ = &mut pads;
             (pads, source.keys())
         };
-        let events = self.state().poll(&self.devices, pads, keys);
-        self.deliver(events);
+        let drain = {
+            let mut state = self.state();
+            let events = state.poll(&self.devices, pads, keys);
+            state.queue.extend(events);
+            state.claim_delivery()
+        };
+        if drain {
+            self.drain();
+        }
     }
 
-    /// Runs callbacks, never under our lock: they call back into us. One
-    /// unregistered since the event was taken does not run, and
-    /// `UnregisterCallback` waits for one that runs.
-    fn deliver(&self, events: Vec<Event>) {
-        let me = std::thread::current().id();
-        for e in events {
-            let r = e.registration;
-            {
+    /// The owner of the delivery turn runs queued callbacks in order.
+    fn drain(&self) {
+        loop {
+            let e = {
                 let mut state = self.state();
-                if !state.callbacks.iter().any(|c| c.token == r.token) {
-                    continue;
+                match state.queue.pop_front() {
+                    Some(e) => e,
+                    None => {
+                        state.delivering = false;
+                        return;
+                    }
                 }
-                state.running.push((r.token, me));
-            }
-            (r.callback)(
-                r.token,
-                r.context as *mut c_void,
-                &self.devices[e.device],
-                e.timestamp,
-                e.current,
-                e.previous,
-            );
-            let mut state = self.state();
-            if let Some(i) = state.running.iter().position(|&x| x == (r.token, me)) {
-                state.running.swap_remove(i);
-            }
-            self.returned.notify_all();
+            };
+            self.invoke(e);
         }
+    }
+
+    /// Call without the state lock, but check and mark the callback running
+    /// under the same lock so unregistration cannot race with its start.
+    fn invoke(&self, e: Event) {
+        let r = e.registration;
+        let me = std::thread::current().id();
+        {
+            let mut state = self.state();
+            if !state.callbacks.iter().any(|c| c.token == r.token)
+                && !state
+                    .enumerating
+                    .iter()
+                    .any(|c| c.registration.token == r.token)
+            {
+                return;
+            }
+            state.running.push((r.token, me));
+        }
+        (r.callback)(
+            r.token,
+            r.context as *mut c_void,
+            &self.devices[e.device],
+            e.timestamp,
+            e.current,
+            e.previous,
+        );
+        let mut state = self.state();
+        if let Some(i) = state.running.iter().position(|&x| x == (r.token, me)) {
+            state.running.swap_remove(i);
+        }
+        self.returned.notify_all();
     }
 
     fn index(&self, device: *const Device) -> Option<usize> {
@@ -485,6 +526,15 @@ impl Hub {
 }
 
 impl State {
+    /// Claim the turn while still holding the lock used to queue the events.
+    fn claim_delivery(&mut self) -> bool {
+        if self.delivering || self.queue.is_empty() {
+            return false;
+        }
+        self.delivering = true;
+        true
+    }
+
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
@@ -539,12 +589,14 @@ impl State {
             } else {
                 (STATUS_CONNECTED, 0)
             };
-            events.extend(
-                self.callbacks
-                    .iter()
-                    .filter(|r| r.matches(devices, index) && r.status & STATUS_CONNECTED != 0)
-                    .map(|r| r.event(index, now, current, previous)),
-            );
+            let event = |r: &Registration| {
+                (r.matches(devices, index) && r.status & STATUS_CONNECTED != 0)
+                    .then(|| r.event(index, now, current, previous))
+            };
+            events.extend(self.callbacks.iter().filter_map(event));
+            for enumeration in &mut self.enumerating {
+                enumeration.hotplug.extend(event(&enumeration.registration));
+            }
         }
     }
 }
@@ -801,32 +853,65 @@ extern "system" fn register_device(
         context: context as usize,
         callback,
     };
-    let mut found = Vec::new();
-    {
+    let (inline, mut drain) = {
         let mut state = hub.state();
-        if enumeration != 0 && status & STATUS_CONNECTED != 0 {
+        let found: Vec<_> = if enumeration != 0 && status & STATUS_CONNECTED != 0 {
             let now = now();
-            found = (0..DEVICES)
+            (0..DEVICES)
                 .filter(|&i| state.slots[i].connected && registration.matches(&hub.devices, i))
                 .map(|i| registration.event(i, now, STATUS_CONNECTED, 0))
-                .collect();
-        }
+                .collect()
+        } else {
+            Vec::new()
+        };
         tracing::info!(
             kind = format_args!("{kind:#x}"),
             enumeration,
             devices = found.len(),
             "input device callback"
         );
-        state.callbacks.push(registration);
-        if enumeration == ASYNC_ENUMERATION {
-            state.pending.append(&mut found);
+        if !out.is_null() {
+            // SAFETY: checked non-null. Publish the token before any callback can run.
+            unsafe { out.write(registration.token) };
+        }
+        if enumeration != ASYNC_ENUMERATION && !found.is_empty() && state.delivering {
+            // The current deliverer can be waiting on a lock held by this caller.
+            // Enumerate inline and hold back this registration's hotplug events.
+            state.enumerating.push(Enumeration {
+                registration,
+                hotplug: Vec::new(),
+            });
+            (found, false)
+        } else {
+            state.callbacks.push(registration);
+            if enumeration == ASYNC_ENUMERATION {
+                state.pending.extend(found);
+            } else {
+                state.queue.extend(found);
+            }
+            (Vec::new(), state.claim_delivery())
+        }
+    };
+    if !inline.is_empty() {
+        for event in inline {
+            hub.invoke(event);
+        }
+        let mut state = hub.state();
+        // The callback can stop itself, so only publish a registration that remains active.
+        if let Some(i) = state
+            .enumerating
+            .iter()
+            .position(|c| c.registration.token == registration.token)
+        {
+            let enumeration = state.enumerating.remove(i);
+            state.callbacks.push(enumeration.registration);
+            state.queue.extend(enumeration.hotplug);
+            drain = state.claim_delivery();
         }
     }
-    if !out.is_null() {
-        // SAFETY: checked non-null.
-        unsafe { out.write(registration.token) };
+    if drain {
+        hub.drain();
     }
-    hub.deliver(found);
     S_OK
 }
 /// Guide button and keyboard layout callbacks: neither ever changes here.
@@ -843,6 +928,7 @@ extern "system" fn register_other(
 fn forget(this: This, token: u64) {
     let mut state = hub(this).state();
     state.callbacks.retain(|r| r.token != token);
+    state.enumerating.retain(|c| c.registration.token != token);
     state.pending.retain(|e| e.registration.token != token);
 }
 extern "system" fn stop_callback(this: This, token: u64) {
@@ -1420,6 +1506,60 @@ mod tests {
         token
     }
 
+    const CALLBACK_WAIT: Duration = Duration::from_secs(5);
+
+    fn register_observer<C: Fn(usize, u32) + Sync>(hub: &Hub, enumeration: u32, observer: &C) {
+        extern "system" fn observe<C: Fn(usize, u32) + Sync>(
+            _: u64,
+            context: *mut c_void,
+            device: *const Device,
+            _: u64,
+            current: u32,
+            _: u32,
+        ) {
+            // SAFETY: the test keeps the observer alive until all polls finish.
+            let (observer, index) = unsafe { (&*context.cast::<C>(), (*device).index) };
+            observer(index, current);
+        }
+        assert_eq!(
+            register_device(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                STATUS_CONNECTED,
+                enumeration,
+                (observer as *const C).cast_mut().cast(),
+                Some(observe::<C>),
+                std::ptr::null_mut(),
+            ),
+            S_OK
+        );
+    }
+
+    fn with_active_poll(test: impl FnOnce(&'static Hub, &Mutex<FakeHost>)) {
+        use std::sync::mpsc::channel;
+
+        let (hub, host) = fake();
+        let (entered, inside) = channel();
+        let (release, wait) = channel();
+        let wait = Mutex::new(wait);
+        let slow = |index, current| {
+            if index == 0 && current == STATUS_CONNECTED {
+                let _ = entered.send(());
+                let _ = wait.lock().unwrap().recv_timeout(2 * CALLBACK_WAIT);
+            }
+        };
+        register_observer(hub, 0, &slow);
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        std::thread::scope(|scope| {
+            let release = release;
+            scope.spawn(move || hub.poll());
+            inside.recv_timeout(CALLBACK_WAIT).unwrap();
+            test(hub, &host);
+            release.send(()).unwrap();
+        });
+    }
+
     fn result(hr: HRESULT, out: *const c_void) -> Result<*const Reading, HRESULT> {
         if hr == S_OK {
             Ok(out.cast())
@@ -1698,6 +1838,91 @@ mod tests {
         assert_eq!(FROM_INSIDE.load(Ordering::SeqCst), 1);
         poller.join().unwrap();
         leave.join().unwrap();
+    }
+
+    #[test]
+    fn callbacks_from_registration_and_poll_are_serialized() {
+        use std::sync::mpsc::channel;
+
+        let (hub, host) = fake();
+        let (entered, inside) = channel();
+        let (release, wait) = channel();
+        let wait = Mutex::new(wait);
+        let log = Mutex::new(Vec::new());
+        let observe = |index, current| {
+            log.lock().unwrap().push((index, current));
+            if index == FALLBACK && current == STATUS_CONNECTED {
+                let _ = entered.send(());
+                let _ = wait.lock().unwrap().recv_timeout(CALLBACK_WAIT);
+            }
+        };
+        std::thread::scope(|scope| {
+            let release = release;
+            scope.spawn(|| register_observer(hub, 2, &observe));
+            inside.recv_timeout(CALLBACK_WAIT).unwrap();
+            host.lock().unwrap().pads[1] = Some(PadState::default());
+            hub.poll();
+            assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED)]);
+            release.send(()).unwrap();
+        });
+        assert_eq!(
+            *log.lock().unwrap(),
+            [(FALLBACK, STATUS_CONNECTED), (1, STATUS_CONNECTED), (FALLBACK, 0)]
+        );
+    }
+
+    #[test]
+    fn blocking_enumeration_finishes_on_registering_thread_while_poll_delivers() {
+        use std::sync::mpsc::channel;
+
+        let finished = Mutex::new(None);
+        let observe = |_, _| *finished.lock().unwrap() = Some(std::thread::current().id());
+        with_active_poll(|hub, _| {
+            let (returned, result) = channel();
+            std::thread::scope(|scope| {
+                let observe = &observe;
+                let finished = &finished;
+                scope.spawn(move || {
+                    register_observer(hub, 2, observe);
+                    let _ = returned.send((std::thread::current().id(), *finished.lock().unwrap()));
+                });
+                let (caller, callback) = result.recv_timeout(CALLBACK_WAIT).unwrap();
+                assert_eq!(callback, Some(caller), "callback must finish before return");
+            });
+        });
+    }
+
+    #[test]
+    fn blocking_enumeration_reports_devices_connected_during_its_callback() {
+        use std::sync::mpsc::channel;
+
+        let (entered, inside) = channel();
+        let (release, wait) = channel();
+        let wait = Mutex::new(wait);
+        let log = Mutex::new(Vec::new());
+        let observe = |index, current| {
+            log.lock().unwrap().push((index, current));
+            if index == 0 {
+                let _ = entered.send(());
+                let _ = wait.lock().unwrap().recv_timeout(CALLBACK_WAIT);
+            }
+        };
+        with_active_poll(|hub, host| {
+            std::thread::scope(|scope| {
+                let observe = &observe;
+                let release = release;
+                scope.spawn(move || register_observer(hub, 2, observe));
+                inside.recv_timeout(CALLBACK_WAIT).unwrap();
+                host.lock().unwrap().pads[1] = Some(PadState::default());
+                hub.poll();
+                assert_eq!(*log.lock().unwrap(), [(0, STATUS_CONNECTED)]);
+                release.send(()).unwrap();
+            });
+        });
+        assert_eq!(
+            *log.lock().unwrap(),
+            [(0, STATUS_CONNECTED), (1, STATUS_CONNECTED)]
+        );
     }
 
     #[test]
