@@ -58,6 +58,10 @@ opt-level = 2
 
 [profile.release]
 debug = "line-tables-only"
+# Thin LTO inlines across the workspace crates (the translator, the host GPU
+# layer and the runtime call each other in hot paths) for far less build time
+# than fat LTO. The `diag` profile inherits it.
+lto = "thin"
 
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),
