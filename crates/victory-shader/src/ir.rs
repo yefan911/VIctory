@@ -43,8 +43,8 @@ pub struct Program {
     pub wave64: bool,
     /// VGPRs v0 up to this exist; bounds M0-relative access.
     pub vgprs: u16,
-    /// In code order, then copies made to give every loop one entry; block 0
-    /// is the entry.
+    /// In code order, then copies made to give every loop one entry. Block 0
+    /// is the entry, which can be an empty block before the code.
     pub blocks: Vec<Block>,
     /// Registers read before any write, with their value on entry: what the
     /// hardware or a called fetch routine set up (user SGPRs, system values,
@@ -55,7 +55,7 @@ pub struct Program {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     /// Byte offset of the block's first machine instruction (shared by a
-    /// block and its copies).
+    /// block and its copies). Zero for an empty entry block.
     pub offset: usize,
     pub preds: Vec<usize>,
     pub phis: Vec<Phi>,
@@ -159,9 +159,17 @@ pub fn build_bounded(
     }
     leaders.sort_unstable();
     leaders.dedup();
+    // When the first instruction is a loop header, give SSA a separate
+    // entry edge to carry the initial register values into its phis.
+    let preheader = usize::from(
+        flows
+            .iter()
+            .any(|flow| matches!(flow, Flow::Jump(0) | Flow::Branch(0))),
+    );
     let block_at = |offset: usize| {
         leaders
             .binary_search(&offset)
+            .map(|b| b + preheader)
             .map_err(|_| isa(offset, "jump into a block"))
     };
 
@@ -175,11 +183,23 @@ pub fn build_bounded(
             exit: Exit::End,
         })
         .collect();
+    if preheader != 0 {
+        blocks.insert(
+            0,
+            Block {
+                offset: 0,
+                preds: Vec::new(),
+                phis: Vec::new(),
+                insts: Vec::new(),
+                exit: Exit::Jump(1),
+            },
+        );
+    }
     let next_offsets: Vec<Option<usize>> = (0..list.len())
         .map(|i| list.get(i + 1).map(|n| n.offset))
         .collect();
     for ((machine, flow), next) in list.into_iter().zip(flows).zip(next_offsets) {
-        let b = leaders.partition_point(|&l| l <= machine.offset) - 1;
+        let b = leaders.partition_point(|&l| l <= machine.offset) - 1 + preheader;
         let name = machine.name().ok_or(ShaderError::Unsupported {
             offset: machine.offset,
             what: "unknown opcode",
@@ -211,12 +231,6 @@ pub fn build_bounded(
         }
     }
     link(&mut blocks);
-    if !blocks[0].preds.is_empty() {
-        return Err(ShaderError::Unsupported {
-            offset: 0,
-            what: "a branch to the program entry",
-        });
-    }
     split_irreducible(&mut blocks)?;
 
     let order = reverse_postorder(&blocks);
@@ -1167,6 +1181,46 @@ mod tests {
         assert_eq!(add.read(Reg::S(0)), Some(phi.value));
         assert_eq!(b1.insts[1].read(Reg::S(0)), add.write(Reg::S(0)));
         assert_eq!(b2.insts[0].name(), "s_endpgm");
+    }
+
+    #[test]
+    fn loops_can_branch_to_offset_zero() {
+        let p = build_words(
+            &[
+                0x8000_8100, // 0: s_add_u32 s0, s0, 1
+                0xBF07_8400, // s_cmp_lg_u32 s0, 4
+                0xBF85_FFFD, // s_cbranch_scc1 -> 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let [entry, header, end] = &p.blocks[..] else {
+            panic!("{:?}", p.blocks);
+        };
+        assert!(entry.preds.is_empty());
+        assert!(entry.insts.is_empty());
+        assert_eq!(entry.exit, Exit::Jump(1));
+        assert_eq!(header.offset, 0);
+        assert_eq!(header.preds, [0, 1]);
+        assert_eq!(
+            header.exit,
+            Exit::Branch {
+                taken: 1,
+                not_taken: 2,
+            }
+        );
+        assert_eq!(end.exit, Exit::End);
+        let [phi] = &header.phis[..] else {
+            panic!("{:?}", header.phis);
+        };
+        let add = &header.insts[0];
+        assert_eq!(phi.reg, Reg::S(0));
+        assert_eq!(
+            phi.args,
+            [input(&p, Reg::S(0)), add.write(Reg::S(0)).unwrap()]
+        );
+        assert_eq!(add.read(Reg::S(0)), Some(phi.value));
+        assert!(crate::structure::structure(&p).is_ok());
     }
 
     #[test]
