@@ -815,7 +815,12 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    let allowed = ALLOWED_NAMES.contains(&name)
+    // Only these synthetic Metal test sources may use Python or Swift.
+    // All size, magic, NUL and encoded-data checks still apply.
+    let allowed = matches!(
+        path,
+        "tests/metal/generate.py" | "tests/metal/run.py" | "tests/metal/probe.swift"
+    ) || ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
             .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));
@@ -1175,6 +1180,18 @@ mod tests {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
+    }
+
+    #[test]
+    fn metal_test_sources_are_still_checked() {
+        assert!(check("tests/metal/generate.py", b"import struct").is_empty());
+        assert!(check("tests/metal/run.py", b"import subprocess").is_empty());
+        assert!(check("tests/metal/probe.swift", b"import Metal").is_empty());
+
+        assert!(!check("other.py", b"pass").is_empty());
+        assert!(!check("other.swift", b"import Metal").is_empty());
+        assert!(!check("tests/metal/probe.swift", b"MZ\x00").is_empty());
+        assert!(!check("tests/metal/run.py", &vec![b'a'; 800]).is_empty());
     }
 
     #[test]
