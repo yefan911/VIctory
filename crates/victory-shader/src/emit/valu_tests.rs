@@ -856,6 +856,129 @@ fn v_fract_f16_never_returns_one() {
     });
 }
 
+/// An f32 result: exactly these bits, any NaN, or within the 1 ULP the
+/// RDNA2 ISA gives the transcendental ops (same sign, finite).
+#[derive(Clone, Copy, Debug)]
+enum F32Want {
+    Bits(u32),
+    Nan,
+    Ulp1(f32),
+}
+
+impl F32Want {
+    fn holds(self, got: u32) -> bool {
+        match self {
+            Self::Bits(b) => got == b,
+            Self::Nan => f32::from_bits(got).is_nan(),
+            Self::Ulp1(v) => {
+                let v = v.to_bits();
+                f32::from_bits(got).is_finite() && (got ^ v) >> 31 == 0 && got.abs_diff(v) <= 1
+            }
+        }
+    }
+}
+
+#[test]
+fn rcp_rsq_sqrt_log_exp_f32_special_values_match_rdna2() {
+    use F32Want::{Bits, Nan, Ulp1};
+    let f = f32::to_bits;
+    let (pinf, ninf, nz, nan) = (0x7F80_0000, 0xFF80_0000, 0x8000_0000, 0x7FC0_0000);
+    let rcp: &[(u32, F32Want)] = &[
+        (0, Bits(pinf)),
+        (nz, Bits(ninf)),
+        (pinf, Bits(0)),
+        (ninf, Bits(nz)),
+        (nan, Nan),
+        (f(2.0), Ulp1(0.5)),
+        (f(-4.0), Ulp1(-0.25)),
+        (f(3.0), Ulp1(1.0 / 3.0)),
+        (f(1e-30), Ulp1((1.0 / f64::from(1e-30f32)) as f32)),
+    ];
+    // (VOP1 opcode, name, cases); v_log_f32 is log2, v_exp_f32 is 2^x.
+    type Cases<'a> = &'a [(u32, F32Want)];
+    let ops: &[(u16, &str, Cases)] = &[
+        (0x02a, "v_rcp_f32", rcp),
+        (0x02b, "v_rcp_iflag_f32", rcp),
+        (
+            0x02e,
+            "v_rsq_f32",
+            &[
+                (0, Bits(pinf)),
+                (nz, Bits(ninf)),
+                (pinf, Bits(0)),
+                (ninf, Nan),
+                (f(-1.0), Nan),
+                (nan, Nan),
+                (f(4.0), Ulp1(0.5)),
+                (f(0.25), Ulp1(2.0)),
+                (f(2.0), Ulp1(std::f32::consts::FRAC_1_SQRT_2)),
+            ],
+        ),
+        (
+            0x033,
+            "v_sqrt_f32",
+            &[
+                (0, Bits(0)),
+                (nz, Bits(nz)),
+                (pinf, Bits(pinf)),
+                (ninf, Nan),
+                (f(-1.0), Nan),
+                (f(-1e-30), Nan),
+                (nan, Nan),
+                (f(4.0), Ulp1(2.0)),
+                (f(2.0), Ulp1(std::f32::consts::SQRT_2)),
+                (f(1e30), Ulp1(f64::from(1e30f32).sqrt() as f32)),
+            ],
+        ),
+        (
+            0x027,
+            "v_log_f32",
+            &[
+                (0, Bits(ninf)),
+                (nz, Bits(ninf)),
+                (pinf, Bits(pinf)),
+                (ninf, Nan),
+                (f(-1.0), Nan),
+                (nan, Nan),
+                (f(1.0), Ulp1(0.0)),
+                (f(8.0), Ulp1(3.0)),
+                (f(0.125), Ulp1(-3.0)),
+                (f(3.0), Ulp1(3f64.log2() as f32)),
+            ],
+        ),
+        (
+            0x025,
+            "v_exp_f32",
+            &[
+                (ninf, Bits(0)),
+                (pinf, Bits(pinf)),
+                (nan, Nan),
+                (0, Ulp1(1.0)),
+                (nz, Ulp1(1.0)),
+                (f(3.0), Ulp1(8.0)),
+                (f(-3.0), Ulp1(0.125)),
+                (f(0.5), Ulp1(std::f32::consts::SQRT_2)),
+                (f(128.0), Bits(pinf)),
+                (f(-200.0), Bits(0)),
+            ],
+        ),
+    ];
+    for &(op, name, cases) in ops {
+        let shader = build_valu_cs(&[vop1(op, 0, vgpr(1))]);
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|&(x, _)| [x, 0, 0, 0]).collect();
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            let want = cases[i].1;
+            assert!(
+                want.holds(got),
+                "{backend}: {name}({:#010x} = {:?}) = {got:#010x} ({:?}), want {want:?}",
+                inp[0],
+                f32::from_bits(inp[0]),
+                f32::from_bits(got),
+            );
+        });
+    }
+}
+
 /// RDNA2's flt16_to_snorm16 / flt16_to_unorm16: clamp, scale by 32767 or
 /// 65535, round the exact product to nearest even; NaN gives 0.
 fn cvt_norm16_reference(bits: u16, signed: bool) -> u16 {
