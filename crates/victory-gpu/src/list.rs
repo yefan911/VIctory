@@ -821,6 +821,18 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
+        if !crate::host::renders_to(texture) {
+            // Its host copy was made without the render-target use (the
+            // host refuses it for the format): no view, no barrier, no clear.
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    resource = format_args!("{:#x}", record.resource as usize),
+                    "clear of a render target the host cannot render to: skipped"
+                )
+            });
+            return;
+        }
         let rtv = host.rtv(texture, record.desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {

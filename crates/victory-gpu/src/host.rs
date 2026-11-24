@@ -1258,6 +1258,25 @@ impl Host {
         handle
     }
 
+    /// A null render target view, for a slot the title binds a texture the
+    /// host cannot render to (its copy was made without that use): draws
+    /// write nothing there, and the other targets keep their slots.
+    pub(crate) fn null_rtv(&self) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        let desc = D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+        unsafe {
+            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
+            handle.ptr += (slot * self.rtv_size) as usize;
+            self.device.CreateRenderTargetView(None, Some(&desc), handle);
+            handle
+        }
+    }
+
     /// A host depth view of `resource`, valid until it is recorded.
     pub(crate) fn dsv(
         &self,
@@ -3100,6 +3119,14 @@ fn title_window() -> Option<HWND> {
 pub(crate) fn legal_state(texture: &ID3D12Resource, state: u32) -> u32 {
     // SAFETY: a plain query.
     legal_for(unsafe { texture.GetDesc() }.Flags.0 as u32, state)
+}
+
+/// Whether the host copy of a texture can be a render target: not when the
+/// host refused that use for its format and the copy was made without it.
+pub(crate) fn renders_to(texture: &ID3D12Resource) -> bool {
+    // SAFETY: a plain query.
+    let flags = unsafe { texture.GetDesc() }.Flags;
+    flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 != 0
 }
 
 /// [`legal_state`] for a texture with resource flags `flags`.
