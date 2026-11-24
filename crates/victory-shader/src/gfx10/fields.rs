@@ -416,6 +416,8 @@ impl Instruction {
                     saddr: (self.encoding != Encoding::Flat)
                         .then(|| scalar(saddr, 1 + u8::from(self.encoding == Encoding::Global))),
                     offset: match self.encoding {
+                        // GFX10 FLAT offsets are 11-bit and unsigned: the
+                        // hardware ignores bit 11.
                         Encoding::Flat => (w0 & 0x7FF) as i16,
                         _ => ((w0 << 4) as i16) >> 4,
                     },
