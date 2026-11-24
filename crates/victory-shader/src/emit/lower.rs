@@ -163,6 +163,17 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+/// Whether a pixel-shader lane entering an IR block has already executed a
+/// `done` export.
+#[derive(Clone, Copy)]
+enum ExportState {
+    Never,
+    Always,
+    /// Some predecessor paths exported and others did not; this `i1` phi tracks
+    /// whether the current lane exported.
+    Dynamic(V),
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -199,8 +210,9 @@ struct Lower<'a> {
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
-    /// Per IR block: a `done` export is behind every lane entering it.
-    exported: Vec<bool>,
+    /// Per IR block: whether lanes entering it have already executed a `done`
+    /// export (pixel shaders).
+    exported: Vec<ExportState>,
     /// Reverse-postorder index per IR block.
     rpo: Vec<usize>,
     /// DXIL block each IR block ends in (guarded stores split blocks).
@@ -661,7 +673,7 @@ impl<'a> Lower<'a> {
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
             edges: HashMap::new(),
-            exported: vec![false; p.blocks.len()],
+            exported: vec![ExportState::Never; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
@@ -1292,6 +1304,62 @@ impl<'a> Lower<'a> {
                 self.counters.insert(b, (phi, Vec::new()));
             }
         }
+        // Pixel shaders: compute which blocks are always, never, or sometimes
+        // entered after a `done` export so mixed joins into `s_endpgm` discard
+        // only the killed lanes instead of killing already-exported pixels.
+        if self.s.pixel {
+            let done: Vec<bool> = (0..p.blocks.len())
+                .map(|b| self.has_done_export(b))
+                .collect();
+            let rest = order.get(1..).unwrap_or(&[]);
+            let mut all = vec![false; p.blocks.len()];
+            for &b in rest {
+                all[b] = true;
+            }
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for &b in rest {
+                    let next = p.blocks[b]
+                        .preds
+                        .iter()
+                        .copied()
+                        .filter(|&q| self.block[q].is_some())
+                        .all(|q| all[q] || done[q]);
+                    if next != all[b] {
+                        all[b] = next;
+                        changed = true;
+                    }
+                }
+            }
+            let mut any = vec![false; p.blocks.len()];
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for &b in rest {
+                    let next = p.blocks[b]
+                        .preds
+                        .iter()
+                        .copied()
+                        .filter(|&q| self.block[q].is_some())
+                        .any(|q| any[q] || done[q]);
+                    if next != any[b] {
+                        any[b] = next;
+                        changed = true;
+                    }
+                }
+            }
+            for &b in &order {
+                self.exported[b] = if all[b] {
+                    ExportState::Always
+                } else if !any[b] {
+                    ExportState::Never
+                } else {
+                    let blk = self.block[b].expect("reachable");
+                    ExportState::Dynamic(self.s.m.phi(blk, self.s.t.i1))
+                };
+            }
+        }
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
@@ -1302,13 +1370,6 @@ impl<'a> Lower<'a> {
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
-            let preds: Vec<usize> = p.blocks[b]
-                .preds
-                .iter()
-                .copied()
-                .filter(|&q| self.block[q].is_some())
-                .collect();
-            self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
             for (i, phi) in p.blocks[b].phis.iter().enumerate() {
                 let val = match phi.reg {
                     Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
@@ -1384,10 +1445,6 @@ impl<'a> Lower<'a> {
             user_data,
             samplers: self.samplers,
         })
-    }
-
-    fn exported_out(&self, b: usize) -> bool {
-        self.exported[b] || self.has_done_export(b)
     }
 
     fn has_done_export(&self, b: usize) -> bool {
@@ -9412,11 +9469,29 @@ impl<'a> Lower<'a> {
                 Term::CondBr(cond, t, f)
             }
             LaneExit::End => {
-                if self.s.pixel && !self.exported[b] && !self.has_done_export(b) {
-                    // A lane leaving without its final export was killed.
-                    let t = self.s.m.bool(true);
-                    self.s
-                        .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+                if self.s.pixel && !self.has_done_export(b) {
+                    match self.exported[b] {
+                        ExportState::Always => {}
+                        ExportState::Never => {
+                            // A lane leaving without its final export was killed.
+                            let t = self.s.m.bool(true);
+                            self.s
+                                .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+                        }
+                        ExportState::Dynamic(exported) => {
+                            // Mixed join: discard only lanes that did not export.
+                            let t = self.s.m.bool(true);
+                            let kill = self.s.m.bin(self.cur, Bin::Xor, exported, t);
+                            self.s.op(
+                                self.cur,
+                                "discard",
+                                Attr::NoUnwind,
+                                self.s.t.void,
+                                82,
+                                &[kill],
+                            );
+                        }
+                    }
                 }
                 Term::Ret
             }
@@ -9852,6 +9927,27 @@ impl<'a> Lower<'a> {
             self.s.m.set_phi(v, incoming);
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
+            self.s.m.set_phi(phi, incoming);
+        }
+        for b in 0..p.blocks.len() {
+            let ExportState::Dynamic(phi) = self.exported[b] else {
+                continue;
+            };
+            let mut incoming = Vec::new();
+            for &q in &p.blocks[b].preds {
+                let Some(qb) = self.tail[q] else { continue };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let x = if self.has_done_export(q) {
+                    self.s.m.bool(true)
+                } else {
+                    match self.exported[q] {
+                        ExportState::Always => self.s.m.bool(true),
+                        ExportState::Never => self.s.m.bool(false),
+                        ExportState::Dynamic(v) => v,
+                    }
+                };
+                incoming.push((x, qb));
+            }
             self.s.m.set_phi(phi, incoming);
         }
         while let Some((v, b, i)) = self.pending_masks.pop() {
