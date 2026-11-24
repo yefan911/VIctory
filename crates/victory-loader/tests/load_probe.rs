@@ -22,8 +22,12 @@ fn workspace_root() -> PathBuf {
 /// Builds the fixture into its own target dir (the outer cargo holds the
 /// lock on the main one while tests run), in the outer one's scratch folder
 /// for tests, so that it follows `CARGO_TARGET_DIR` like the rest of the
-/// build.
+/// build. `VICTORY_HLE_PROBE` names a fixture built beforehand instead, for
+/// runners that cannot start cargo (tests under Wine).
 fn build_probe() -> PathBuf {
+    if let Some(prebuilt) = std::env::var_os("VICTORY_HLE_PROBE") {
+        return prebuilt.into();
+    }
     let manifest = workspace_root().join("tests/fixtures/hle-probe/Cargo.toml");
     let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("hle-probe");
     let status = Command::new(env!("CARGO"))

@@ -1,6 +1,7 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
 mod policy;
+mod wine;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -26,6 +27,20 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Linux host: cross-build for Windows and run the tests under Wine
+    /// (clang-cl, lld-link and llvm-lib on PATH, an `xwin` splat).
+    WineTest {
+        /// The `xwin splat` output folder (default: ~/.xwin).
+        #[arg(long)]
+        xwin: Option<PathBuf>,
+        /// Folder with vkd3d-proton's x64 d3d12.dll and d3d12core.dll, used
+        /// instead of Wine's own D3D12 (which lacks shader model 6.6).
+        #[arg(long)]
+        vkd3d_proton: Option<PathBuf>,
+        /// Arguments for `cargo test` (default: the workspace but xtask).
+        #[arg(last = true)]
+        args: Vec<std::ffi::OsString>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -47,6 +62,18 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Cmd::WineTest {
+            xwin,
+            vkd3d_proton,
+            args,
+        } => wine::run(
+            &root,
+            wine::Options {
+                xwin,
+                vkd3d_proton,
+                args,
+            },
+        ),
     }
 }
 

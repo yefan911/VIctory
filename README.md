@@ -124,6 +124,13 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+Tests on a Linux host, under Wine: `cargo xtask wine-test` cross-builds the
+Windows test binaries (clang-cl, lld-link and llvm-lib on `PATH`, the MSVC CRT
+and Windows SDK from `xwin splat --output ~/.xwin`) and runs them in a Wine
+prefix of their own under `target/`. `--vkd3d-proton <dir>` puts that
+folder's `d3d12.dll` and `d3d12core.dll` into the prefix (Wine's own D3D12
+has no shader model 6.6); arguments after `--` go to `cargo test`.
+
 ## Commands
 
 ```
