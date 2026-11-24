@@ -11,8 +11,9 @@
 //!   numeric, or fail if a name is required, as with no network.
 //! * `WinHttpConnect` to a host that is not loopback fails with
 //!   `ERROR_WINHTTP_CANNOT_CONNECT`, so no request (or WebSocket) handle can
-//!   exist for one. Proxies are off and proxy auto-detection (WPAD, PAC
-//!   downloads) fails with `ERROR_WINHTTP_AUTODETECTION_FAILED`.
+//!   exist for one. Automatic redirects are disabled, including redirects
+//!   returned by a loopback server. Proxies are off and proxy auto-detection
+//!   (WPAD, PAC downloads) fails with `ERROR_WINHTTP_AUTODETECTION_FAILED`.
 //! * A bind to all interfaces is narrowed to loopback, so nothing on the
 //!   network can connect in.
 #![allow(non_snake_case)]
@@ -23,7 +24,7 @@ use std::ffi::{CStr, c_char, c_void};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 
-use windows_sys::Win32::Foundation::SetLastError;
+use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
 
 use crate::modules::files::host;
 use crate::{HleExport, HleModule, hle_export};
@@ -45,6 +46,8 @@ const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0006;
 const SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0024;
 const WINHTTP_ACCESS_TYPE_NO_PROXY: u32 = 1;
 const WINHTTP_OPTION_PROXY: u32 = 38;
+const WINHTTP_OPTION_REDIRECT_POLICY: u32 = 88;
+const WINHTTP_OPTION_REDIRECT_POLICY_NEVER: u32 = 0;
 
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -813,8 +816,8 @@ pub extern "system" fn WinHttpConnect(
     )
 }
 
-/// Sessions never use a proxy: only loopback is reachable, and a proxy
-/// (named, or found by auto-detection) would carry it off the machine.
+/// Sessions never use a proxy or follow redirects: either could carry a
+/// loopback request off the machine inside the host's own WinHTTP calls.
 pub extern "system" fn WinHttpOpen(
     agent: *const u16,
     access: u32,
@@ -825,16 +828,44 @@ pub extern "system" fn WinHttpOpen(
     if access != WINHTTP_ACCESS_TYPE_NO_PROXY {
         once("HTTP proxy ignored", format!("access type {access}"));
     }
-    host!("winhttp.dll", "WinHttpOpen": extern "system" fn(*const u16, u32, *const u16, *const u16, u32) -> Handle)(
+    let session = host!("winhttp.dll", "WinHttpOpen": extern "system" fn(*const u16, u32, *const u16, *const u16, u32) -> Handle)(
         agent,
         WINHTTP_ACCESS_TYPE_NO_PROXY,
         std::ptr::null(),
         std::ptr::null(),
         flags,
-    )
+    );
+    if session.is_null() || no_http_redirects(session) == 0 {
+        return std::ptr::null_mut();
+    }
+    session
 }
 
-/// See [`WinHttpOpen`]: a proxy set later is accepted and not used.
+/// Applies the documented DWORD policy to a session or request. If the
+/// host cannot enforce it, the handle is closed and the original error
+/// is preserved; an unguarded handle must not remain usable.
+fn no_http_redirects(handle: Handle) -> i32 {
+    let policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+    let result = host!("winhttp.dll", "WinHttpSetOption": extern "system" fn(Handle, u32, *const c_void, u32) -> i32)(
+        handle,
+        WINHTTP_OPTION_REDIRECT_POLICY,
+        (&raw const policy).cast(),
+        std::mem::size_of_val(&policy) as u32,
+    );
+    if result == 0 {
+        // SAFETY: reads only the calling thread's last error.
+        let error = unsafe { GetLastError() };
+        if !handle.is_null() {
+            host!("winhttp.dll", "WinHttpCloseHandle": extern "system" fn(Handle) -> i32)(handle);
+        }
+        // SAFETY: restore the option failure after closing the unsafe handle.
+        unsafe { SetLastError(error) };
+    }
+    result
+}
+
+/// See [`WinHttpOpen`]: later proxy settings are ignored and every redirect
+/// policy change still enforces NEVER, on both sessions and requests.
 pub extern "system" fn WinHttpSetOption(
     handle: Handle,
     option: u32,
@@ -844,6 +875,13 @@ pub extern "system" fn WinHttpSetOption(
     if option == WINHTTP_OPTION_PROXY {
         once("HTTP proxy ignored", "WINHTTP_OPTION_PROXY".into());
         return 1;
+    }
+    if option == WINHTTP_OPTION_REDIRECT_POLICY {
+        once(
+            "HTTP redirects disabled",
+            "WINHTTP_OPTION_REDIRECT_POLICY".into(),
+        );
+        return no_http_redirects(handle);
     }
     host!("winhttp.dll", "WinHttpSetOption": extern "system" fn(Handle, u32, *const c_void, u32) -> i32)(
         handle, option, buffer, len,
@@ -953,6 +991,10 @@ pub(crate) fn module() -> HleModule {
         ],
     }
 }
+
+#[cfg(test)]
+#[path = "net_redirect_tests.rs"]
+mod redirect_tests;
 
 #[cfg(test)]
 mod tests {
