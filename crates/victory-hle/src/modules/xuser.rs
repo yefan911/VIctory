@@ -94,7 +94,7 @@ extern "system" fn duplicate(_: This, _: Handle, out: *mut Handle) -> HRESULT {
 }
 extern "system" fn close(_: This, _: Handle) {}
 extern "system" fn compare(_: This, a: Handle, b: Handle) -> i32 {
-    i32::from(a != b)
+    a.addr().cmp(&b.addr()) as i32
 }
 
 /// The current HLE supports one offline local user.
@@ -441,5 +441,21 @@ mod tests {
             xasync::XAsyncGetStatus(&mut block, true),
             FAILED_TO_GET_TOKEN
         );
+    }
+
+    #[test]
+    fn xuser_compare_is_antisymmetric() {
+        type Compare = extern "system" fn(This, Handle, Handle) -> i32;
+        let this: This = &OBJECT;
+        let cmp = slot::<Compare>(&OBJECT, 0x28);
+        let u = user();
+        let null = std::ptr::null();
+        assert_eq!(cmp(this, u, u), 0);
+        assert_eq!(cmp(this, null, null), 0);
+        let null_vs_user = cmp(this, null, u);
+        let user_vs_null = cmp(this, u, null);
+        assert!(null_vs_user < 0);
+        assert!(user_vs_null > 0);
+        assert_eq!(null_vs_user, -user_vs_null);
     }
 }
