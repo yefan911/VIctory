@@ -177,6 +177,16 @@ fn parse_manifest(bytes: &[u8]) -> Option<Vec<String>> {
     (out.len() >= 2).then_some(out)
 }
 
+/// The number of a committed version's folder: `v<N>` exactly as `commit`
+/// names it, without a sign or leading zeros. Any other name (`v01`, `v+1`)
+/// is not a version, so recovery neither counts nor removes it; read as a
+/// number, it would stand for the committed version and have it removed.
+fn version_number(file: &str) -> Option<u64> {
+    let digits = file.strip_prefix('v')?;
+    let number = digits.parse::<u64>().ok()?;
+    (number.to_string() == digits).then_some(number)
+}
+
 /// The container's newest committed version, if any. Removes what a crash
 /// left: unfinished versions and older ones.
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
@@ -186,7 +196,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
             std::fs::remove_dir_all(entry.path())?;
-        } else if let Some(n) = file.strip_prefix('v').and_then(|n| n.parse::<u64>().ok()) {
+        } else if let Some(n) = version_number(&file) {
             committed.push(n);
         }
     }
@@ -194,9 +204,6 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let Some(&number) = committed.last() else {
         return Ok(None);
     };
-    for old in &committed[..committed.len() - 1] {
-        std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
-    }
     let version = dir.join(format!("v{number}"));
     let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
     // The version directory exists, so a missing or unreadable manifest is a
@@ -206,6 +213,9 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let mut names = parse_manifest(&manifest).ok_or_else(bad)?;
     let blobs = names.split_off(2);
     let [name, display] = <[String; 2]>::try_from(names).map_err(|_| bad())?;
+    for old in &committed[..committed.len() - 1] {
+        std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+    }
     Ok(Some(Version {
         dir: version,
         number,
@@ -1050,6 +1060,28 @@ mod tests {
         Some((display, blobs.into_iter().map(text).collect()))
     }
 
+    #[test]
+    fn unreadable_latest_manifest_preserves_previous_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let older = dir.path().join("v1");
+        let latest = dir.path().join("v2");
+        std::fs::create_dir(&older).unwrap();
+        std::fs::create_dir(&latest).unwrap();
+        std::fs::write(older.join(MANIFEST), manifest("Slot", "Previous", &[])).unwrap();
+
+        assert!(current(dir.path()).is_err());
+        assert!(older.join(MANIFEST).is_file());
+
+        std::fs::write(latest.join(MANIFEST), []).unwrap();
+        assert!(current(dir.path()).is_err());
+        assert!(older.join(MANIFEST).is_file());
+
+        std::fs::write(latest.join(MANIFEST), manifest("Slot", "Latest", &[])).unwrap();
+        let loaded = current(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.number, 2);
+        assert!(!older.exists());
+    }
+
     fn old_state() -> Option<(String, Vec<(String, String)>)> {
         Some(("one".into(), vec![("a".into(), "old a".into()), ("b".into(), "old b".into())]))
     }
@@ -1143,6 +1175,39 @@ mod tests {
             }
             assert!(seen.0 > 0 && seen.1 > 1, "{op}: {seen:?}");
         }
+    }
+
+    /// A folder whose name only reads as a committed version's number is
+    /// not one: recovery keeps the committed save and leaves the folder be.
+    #[test]
+    fn a_folder_named_like_a_version_does_not_remove_the_save() {
+        for good in ["v0", "v1", "v10", "v18446744073709551615"] {
+            assert!(version_number(good).is_some(), "{good}");
+        }
+        for bad in ["v01", "v001", "v+1", "v-1", "v 1", "v", "1", "V1", "v1.new", "v1x"] {
+            assert_eq!(version_number(bad), None, "{bad}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+        let slot = container_dir(root, "Slot");
+        assert!(slot.join("v1").is_dir());
+        let strays = ["v01", "v001", "v+1"];
+        for stray in strays {
+            std::fs::create_dir(slot.join(stray)).unwrap();
+        }
+        assert_eq!(state(root), old_state());
+        assert!(slot.join("v1").is_dir());
+        for stray in strays {
+            assert!(slot.join(stray).is_dir(), "{stray}");
+        }
+
+        // Updates still go on from the committed version.
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK);
+        assert!(slot.join("v2").is_dir() && !slot.join("v1").exists());
+        let new = ("two".into(), vec![("a".into(), "new a".into()), ("b".into(), "old b".into())]);
+        assert_eq!(state(root), Some(new));
     }
 
     #[test]
