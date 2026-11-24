@@ -106,8 +106,17 @@ fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
     });
     let elapsed = c.start.elapsed().as_nanos();
     let interval = c.interval.as_nanos().max(1);
-    let tick =
-        (c.first + (elapsed / interval + 1) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
+    let last_tick = last(kind).load(Ordering::Relaxed);
+    // The tick most recently passed. A flip (or vblank) wait that begins
+    // after a tick nobody has taken yet is late: the frame took longer than
+    // an interval. It ends at once on that tick instead of waiting for the
+    // following one, so a frame a little over budget costs that much more,
+    // not a whole extra interval (30 fps falling straight to 15).
+    let passed = c.first + (elapsed / interval) as u64;
+    if kind != ORIGIN && passed > last_tick && passed > c.first {
+        return (passed, Duration::ZERO);
+    }
+    let tick = (c.first + (elapsed / interval + 1) as u64).max(last_tick + 1);
     let at = u128::from(tick - c.first) * interval;
     let wait = Duration::from_nanos(at.saturating_sub(elapsed) as u64);
     if wait <= limit {
@@ -228,6 +237,23 @@ mod tests {
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP, Duration::ZERO);
         assert!(tick > flips[3]);
+
+        // A frame over budget: its flip wait begins after a tick nobody
+        // took and ends at once on it, not on the tick after.
+        assert_eq!(set_interval(null, null, 20_000, 1, 0), S_OK);
+        assert_eq!(
+            wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
+            S_OK
+        );
+        let flipped = LAST[2].load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(25));
+        let late = Instant::now();
+        assert_eq!(
+            wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
+            S_OK
+        );
+        assert!(late.elapsed() < Duration::from_millis(10));
+        assert_eq!(LAST[2].load(Ordering::Relaxed), flipped + 1);
     }
 
     /// Two waits for one kind that begin together (two threads) take two
