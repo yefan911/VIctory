@@ -16,6 +16,10 @@ use crate::{io, ir, resource, structure};
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
 /// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
 fn build(words: &[u32], buffers: bool) -> HostShader {
+    build_with_handle_count(words, buffers, 1)
+}
+
+fn build_with_handle_count(words: &[u32], buffers: bool, nonuniform_handles: u32) -> HostShader {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -71,8 +75,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         mesh_stride: 0,
     })
     .expect("lower");
-    // One access with each lane's own heap index, no wave operation.
-    assert_eq!(lowered.nonuniform_handles, 1);
+    assert_eq!(lowered.nonuniform_handles, nonuniform_handles);
     assert!(!lowered.wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -165,6 +168,45 @@ fn sampled(shader: &HostShader) -> Vec<(&'static str, Vec<f32>)> {
         .into_iter()
         .map(|(label, words)| (label, words.into_iter().map(f32::from_bits).collect()))
         .collect()
+}
+
+#[test]
+fn packed_image_load_keeps_unwritten_high_half() {
+    let texels = [[1.0, 2.0, 3.0, 4.0]];
+    let views = [
+        View::Texture(1, 1, &texels),
+        View::Texture(1, 1, &texels),
+        View::RawUav(32),
+    ];
+    for (dmask, reg, seed, want) in [
+        (1, 12, 0x5a5a_1234, 0x5a5a_3c00),
+        (3, 12, 0x5a5a_1234, 0x4000_3c00),
+        (7, 13, 0xdead_5678, 0xdead_4200),
+    ] {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7E00_02FF | reg << 17,
+            seed, // v_mov_b32 v[reg], seed
+            0xF000_0008 | dmask << 8,
+            0x8003_0C02, // image_load v12..., v[2:3], s[12:19] dim:2D d16
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0xE070_1000,
+            0x800A_0010 | reg << 8, // buffer_store_dword v[reg], v16, s[40:43], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let results = run(&build_with_handle_count(&words, false, 0), &views);
+        assert!(!results.is_empty(), "no SM 6.6 test adapter");
+        for (backend, got) in results {
+            assert_eq!(got, [want; 32], "{backend}: dmask {dmask:#x}");
+        }
+    }
 }
 
 #[test]

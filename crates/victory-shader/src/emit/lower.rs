@@ -8246,15 +8246,18 @@ impl<'a> Lower<'a> {
             });
         }
         if *d16 {
-            // Two channels per VGPR, low half first (an odd last high half 0).
+            // Two channels per VGPR, low half first.
             let k16 = self.s.m.i32(16);
             xs = xs
                 .chunks(2)
-                .map(|p| match *p {
+                .enumerate()
+                .map(|(k, p)| match *p {
                     [lo, hi] => {
                         let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
                         self.s.m.bin(c, Bin::Or, lo, hi)
                     }
+                    // An odd image load only writes the last register's low half.
+                    [lo] if op == 66 => self.low_half(inst, reg + k as u8, lo),
                     _ => p[0],
                 })
                 .collect();
