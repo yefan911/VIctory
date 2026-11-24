@@ -2771,7 +2771,22 @@ impl Meter {
                         match next {
                             // SAFETY: a window handle and a NUL-terminated text.
                             Some((hwnd, text)) => unsafe {
-                                let _ = SetWindowTextW(HWND(hwnd as *mut _), PCWSTR(text.as_ptr()));
+                                let hwnd = HWND(hwnd as *mut _);
+                                let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+                                let frame = (WS_CAPTION | WS_THICKFRAME).0 as isize;
+                                if style & frame != 0
+                                    && SetWindowLongPtrW(hwnd, GWL_STYLE, style & !frame) != 0
+                                {
+                                    let flags = SWP_FRAMECHANGED
+                                        | SWP_NOMOVE
+                                        | SWP_NOSIZE
+                                        | SWP_NOZORDER
+                                        | SWP_NOACTIVATE;
+                                    if SetWindowPos(hwnd, None, 0, 0, 0, 0, flags).is_err() {
+                                        SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+                                    }
+                                }
+                                let _ = SetWindowTextW(hwnd, PCWSTR(text.as_ptr()));
                             },
                             None => std::thread::sleep(std::time::Duration::from_millis(100)),
                         }
