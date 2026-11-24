@@ -58,9 +58,8 @@ pub const INTERFACES: &[Interface] = &[
 type This = *const Object;
 
 /// 2: disabled. We present in SDR, so the title must render SDR.
-// shortcut: HDR output is not done (see the presentation items in
-// `TODO.md`); report enabled, with the host display's luminance, once the
-// swap chain can present HDR.
+// shortcut: HDR output is not done; report enabled, with the host
+// display's luminance, once the swap chain can present HDR.
 extern "system" fn try_enable_hdr(_: This, preference: u32, _info: *mut c_void) -> u32 {
     tracing::info!(preference, "HDR mode: disabled (SDR presentation)");
     2
