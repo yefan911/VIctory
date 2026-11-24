@@ -175,7 +175,24 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
 /// modules take this lock too.
 pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
+/// `Host::new(false)` also selects WARP when the environment forces it.
+/// Do not run that backend twice or label software results as hardware.
+pub(super) fn backends(force_warp: bool) -> &'static [(&'static str, bool)] {
+    if force_warp {
+        &[("warp", true)]
+    } else {
+        &[("hardware", false), ("warp", true)]
+    }
+}
+
+#[test]
+fn forced_warp_runs_only_the_software_backend() {
+    assert_eq!(backends(true), &[("warp", true)]);
+    assert_eq!(backends(false), &[("hardware", false), ("warp", true)]);
+}
+
+/// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP,
+/// or WARP alone with `VICTORY_WARP=1`) for
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
 fn run_cases(
     shader: &HostShader,
@@ -184,7 +201,8 @@ fn run_cases(
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    for &(label, warp) in backends(force_warp) {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
