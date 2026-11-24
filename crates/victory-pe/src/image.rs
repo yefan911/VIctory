@@ -106,15 +106,17 @@ pub struct CodeViewInfo {
 impl CodeViewInfo {
     /// The key symbol servers use: GUID (Windows byte order) + age.
     pub fn symbol_key(&self) -> String {
+        use std::fmt::Write;
         let g = &self.guid;
         let d1 = u32::from_le_bytes([g[0], g[1], g[2], g[3]]);
         let d2 = u16::from_le_bytes([g[4], g[5]]);
         let d3 = u16::from_le_bytes([g[6], g[7]]);
-        let mut s = format!("{d1:08X}{d2:04X}{d3:04X}");
+        let mut s = String::with_capacity(40);
+        let _ = write!(s, "{d1:08X}{d2:04X}{d3:04X}");
         for b in &g[8..] {
-            s.push_str(&format!("{b:02X}"));
+            let _ = write!(s, "{b:02X}");
         }
-        s.push_str(&format!("{:X}", self.age));
+        let _ = write!(s, "{:X}", self.age);
         s
     }
 }
@@ -804,5 +806,18 @@ mod tests {
                 (Some("gamma"), 3, Some(0x1204))
             ]
         );
+    }
+
+    #[test]
+    fn symbol_key_matches_pdb_convention() {
+        let cv = CodeViewInfo {
+            pdb_path: "test.pdb".into(),
+            guid: [
+                0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+                0x77, 0x88,
+            ],
+            age: 1,
+        };
+        assert_eq!(cv.symbol_key(), "78563412BC9AF0DE11223344556677881");
     }
 }
