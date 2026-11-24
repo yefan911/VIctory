@@ -6,7 +6,7 @@
 //! `bin\<version>\x64\dxil.dll`, else wherever `LoadLibrary` finds it.
 
 use std::ffi::c_void;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
@@ -114,6 +114,17 @@ pub struct Validator {
     module: HMODULE,
 }
 
+pub(super) const SDK_BIN: &str = r"C:\Program Files (x86)\Windows Kits\10\bin";
+
+pub(super) fn sdk_tool(kits: &Path, name: &str) -> Option<PathBuf> {
+    std::fs::read_dir(kits)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("x64").join(name))
+        .filter(|path| path.exists())
+        .max()
+}
+
 // SAFETY: the validator object is free-threaded (DXC's validator has no
 // thread affinity) and the module handle is process-wide; calls are
 // serialised by `&mut self`.
@@ -122,18 +133,9 @@ unsafe impl Send for Validator {}
 impl Validator {
     /// Where `dxil.dll` is looked for.
     pub fn default_path() -> Option<PathBuf> {
-        if let Some(p) = std::env::var_os("VICTORY_DXIL") {
-            return Some(p.into());
-        }
-        let kits = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\bin");
-        let mut versions: Vec<PathBuf> = std::fs::read_dir(&kits)
-            .ok()?
-            .filter_map(Result::ok)
-            .map(|e| e.path().join(r"x64\dxil.dll"))
-            .filter(|p| p.exists())
-            .collect();
-        versions.sort();
-        versions.pop()
+        std::env::var_os("VICTORY_DXIL")
+            .map(PathBuf::from)
+            .or_else(|| sdk_tool(Path::new(SDK_BIN), "dxil.dll"))
     }
 
     /// Loads `path`'s validator (or `dxil.dll` from the DLL search path).
