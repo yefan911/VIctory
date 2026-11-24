@@ -192,7 +192,12 @@ pub extern "system" fn ApuAlloc(
     align: u32,
     _flags: u32,
 ) -> HRESULT {
-    if out.is_null() || size == 0 || align < 4 || !align.is_power_of_two() {
+    if out.is_null()
+        || size == 0
+        || align < 4
+        || !align.is_power_of_two()
+        || size.checked_add(align).is_none()
+    {
         return E_INVALIDARG;
     }
     let Some((ptr, address)) = heap_alloc(size as usize, align as usize) else {
@@ -213,10 +218,16 @@ pub extern "system" fn ApuFree(ptr: *mut c_void) {
 }
 
 pub extern "system" fn ApuMapVirtualAddress(ptr: *const c_void) -> u32 {
+    if ptr.is_null() {
+        return 0;
+    }
     heap_map(ptr as usize)
 }
 
 pub extern "system" fn ApuIsVirtualAddressValid(ptr: *const c_void, align: u32) -> bool {
+    if ptr.is_null() {
+        return false;
+    }
     let apu = heap_map(ptr as usize);
     apu != 0 && (align == 0 || apu.is_multiple_of(align))
 }
@@ -492,9 +503,10 @@ impl Xma {
         let start = Instant::now();
         let mut active = 0;
         for index in 0..self.voices.len() as u32 {
-            if let (Some(context), Some(voice)) =
-                (self.context(index), &mut *lock(&self.voices[index as usize]))
-            {
+            if let (Some(context), Some(voice)) = (
+                self.context(index),
+                &mut *lock(&self.voices[index as usize]),
+            ) {
                 pump(context, voice);
                 active += 1;
             }
@@ -650,7 +662,10 @@ fn dump_input(index: u32, context: Context) {
     );
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join(format!("{n:02}-{index}.ctx")), words);
-    let _ = std::fs::write(dir.join(format!("{n:02}-{index}.xma")), input.unwrap_or_default());
+    let _ = std::fs::write(
+        dir.join(format!("{n:02}-{index}.xma")),
+        input.unwrap_or_default(),
+    );
 }
 
 /// Starts the decoding thread on the first enabled voice, and has it fill
@@ -936,6 +951,9 @@ mod tests {
         assert_eq!(heap_unmap(apu + 4), Some(ptr.cast::<u8>().wrapping_add(4)));
         ApuFree(ptr);
         assert_eq!(ApuMapVirtualAddress(ptr), 0);
+        assert!(!ApuIsVirtualAddressValid(std::ptr::null(), 0));
+        assert_eq!(ApuMapVirtualAddress(std::ptr::null()), 0);
+        assert_eq!(ApuAlloc(&mut ptr, &mut apu, u32::MAX, 128, 1), E_INVALIDARG);
         assert_eq!(ApuAlloc(&mut ptr, &mut apu, 0x100, 6, 1), E_INVALIDARG);
     }
 
