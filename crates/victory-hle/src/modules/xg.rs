@@ -350,12 +350,13 @@ extern "system" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
 }
 
 /// The plane, its mip and array slice for a subresource index, and the
-/// tiled bytes and the linear bytes the copy touches.
+/// tiled byte range and linear byte count the copy touches.
 struct CopyArgs<'a> {
     layout: &'a Layout,
     mip: u32,
     slice: u32,
-    tiled: usize,
+    tiled_offset: usize,
+    tiled_len: usize,
     linear: usize,
 }
 
@@ -369,15 +370,37 @@ fn copy_args(
     let p = c.texture.planes.get(plane as usize)?;
     let l = &p.layout;
     let (mip, slice) = (subresource % c.mips, subresource / c.mips);
+    if slice >= l.slices {
+        return None;
+    }
     let m = l.mips.get(mip as usize)?;
-    let bytes = m.width as usize * l.desc.element_bytes as usize;
-    let depths = l.subresource_depth(mip) as usize;
-    let linear = (depths - 1) * depth as usize + (m.height as usize - 1) * row as usize + bytes;
+    let bytes = usize::try_from(m.width)
+        .ok()?
+        .checked_mul(usize::try_from(l.desc.element_bytes).ok()?)?;
+    let depths = usize::try_from(l.subresource_depth(mip)).ok()?;
+    let depth_span = depths
+        .checked_sub(1)?
+        .checked_mul(usize::try_from(depth).ok()?)?;
+    let row_span = usize::try_from(m.height)
+        .ok()?
+        .checked_sub(1)?
+        .checked_mul(usize::try_from(row).ok()?)?;
+    let linear = depth_span.checked_add(row_span)?.checked_add(bytes)?;
+    if linear > isize::MAX as usize {
+        return None;
+    }
+    let tiled_end = p.offset.checked_add(l.size)?;
+    if usize::try_from(tiled_end).ok()? > isize::MAX as usize {
+        return None;
+    }
+    let tiled_offset = usize::try_from(p.offset).ok()?;
+    let tiled_len = usize::try_from(l.size).ok()?;
     Some(CopyArgs {
         layout: l,
         mip,
         slice,
-        tiled: (p.offset + l.size) as usize,
+        tiled_offset,
+        tiled_len,
         linear,
     })
 }
@@ -407,11 +430,10 @@ extern "system" fn copy_into(
     if tiled.is_null() || linear.is_null() {
         return E_INVALIDARG;
     }
-    let offset = c.texture.planes[plane as usize].offset as usize;
     // SAFETY: the title's memory holds the whole texture and its rows.
     let (tiled, linear) = unsafe {
         (
-            std::slice::from_raw_parts_mut(tiled.add(offset), a.tiled - offset),
+            std::slice::from_raw_parts_mut(tiled.add(a.tiled_offset), a.tiled_len),
             std::slice::from_raw_parts(linear, a.linear),
         )
     };
@@ -444,11 +466,10 @@ extern "system" fn copy_from(
     if tiled.is_null() || linear.is_null() {
         return E_INVALIDARG;
     }
-    let offset = c.texture.planes[plane as usize].offset as usize;
     // SAFETY: the title's memory holds the whole texture and its rows.
     let (tiled, linear) = unsafe {
         (
-            std::slice::from_raw_parts(tiled.add(offset), a.tiled - offset),
+            std::slice::from_raw_parts(tiled.add(a.tiled_offset), a.tiled_len),
             std::slice::from_raw_parts_mut(linear, a.linear),
         )
     };
@@ -503,6 +524,10 @@ extern "system" fn tiling(
     if l.thick {
         return E_NOTIMPL;
     }
+    // SAFETY: `count` is null or a valid pointer to the caller's capacity.
+    if unsafe { count.as_ref().is_some_and(|&n| n > 0) } && out.is_null() {
+        return E_INVALIDARG;
+    }
     let standard = l.first_tail_mip;
     let tail = standard < c.mips;
     let tail_tiles = match standard {
@@ -511,8 +536,8 @@ extern "system" fn tiling(
         _ => 0,
     };
     let block = l.desc.block;
-    // SAFETY: each output is null or room for its value; `out` has room
-    // for `*count` entries.
+    // SAFETY: each output is null or room for its value; `out` is non-null
+    // whenever `*count > 0` and has room for `*count` entries.
     unsafe {
         if let Some(t) = tiles.as_mut() {
             *t = (l.size / TILE) as u32;
@@ -530,7 +555,7 @@ extern "system" fn tiling(
         }
         if let Some(n) = count.as_mut() {
             let slices = if tail { l.slices.min(2) } else { l.slices };
-            let wanted = (standard * slices).saturating_sub(first).min(*n);
+            let wanted = standard.saturating_mul(slices).saturating_sub(first).min(*n);
             for i in 0..wanted {
                 let (slice, mip) = ((first + i) / standard, (first + i) % standard);
                 let m = &l.mips[mip as usize];
@@ -821,5 +846,80 @@ mod tests {
         let bad = desc(256, 256, 1, 28, 0x103);
         assert_eq!(XGCreateTextureComputer(&bad, &mut c), E_INVALIDARG);
         assert!(module().exports.len() == 2);
+    }
+
+    #[test]
+    fn tiling_rejects_null_out_when_count_nonzero() {
+        type Tiling = extern "system" fn(
+            This,
+            *mut u32,
+            *mut PackedMips,
+            *mut [u32; 3],
+            *mut u32,
+            u32,
+            *mut SubresourceTiling,
+        ) -> HRESULT;
+        let c = create(&desc(256, 256, 0, 98, 0x10a));
+        let tiling: Tiling = slot(c, 10);
+
+        let mut tiles = 99;
+        let mut count = 2;
+        assert_eq!(
+            tiling(
+                c,
+                &mut tiles,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut count,
+                0,
+                std::ptr::null_mut(),
+            ),
+            E_INVALIDARG
+        );
+        // Failed call leaves caller's outputs untouched.
+        assert_eq!((tiles, count), (99, 2));
+
+        // Zero capacity with null `out` is allowed and fills the summary fields.
+        count = 0;
+        assert_eq!(
+            tiling(
+                c,
+                &mut tiles,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut count,
+                0,
+                std::ptr::null_mut(),
+            ),
+            S_OK
+        );
+        assert_eq!((tiles, count), (2, 0));
+        assert_eq!(release(c), 0);
+    }
+
+    #[test]
+    fn copy_rejects_out_of_range_slice_and_plane() {
+        type Into = extern "system" fn(This, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
+        type From =
+            extern "system" fn(This, *mut u8, u32, u32, u32, *const u8, u32, u32) -> HRESULT;
+        let c = create(&desc(64, 64, 2, 98, 0x10a));
+        let (into, from): (Into, From) = (slot(c, 8), slot(c, 9));
+
+        // 1 slice, 2 mips -> subresource 2 is slice 1 (out of range).
+        // Must fail in `copy_args` before touching `tiled` or `linear`.
+        let mut dummy = [0u8; 16];
+        assert_eq!(
+            into(c, dummy.as_mut_ptr(), 0, 2, dummy.as_ptr(), 256, 0),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            from(c, dummy.as_mut_ptr(), 0, 2, 0, dummy.as_ptr(), 256, 0),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            into(c, dummy.as_mut_ptr(), 1, 0, dummy.as_ptr(), 256, 0),
+            E_INVALIDARG
+        );
+        assert_eq!(release(c), 0);
     }
 }
