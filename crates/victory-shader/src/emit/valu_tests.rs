@@ -1093,6 +1093,24 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             inp[0], inp[1], inp[2],
         );
     });
+
+    // s_bfe_u32 s6, s0, s1 (SOP2 opcode 0x27): the same 7-bit width as the signed form,
+    // so width=32 keeps all 32 bits and nothing is sign-extended.
+    let s_unsigned = build_valu_cs(&[sop2(0x27, 6, 0, 1), vop1(0x001, 0, sgpr(6))]);
+    let mut su_cases = unsigned_cases.to_vec();
+    su_cases.push(([0x8000_0000, 4, 32, 0], 0x0800_0000));
+    let su_in: Vec<[u32; 4]> = su_cases
+        .iter()
+        .map(|&(inp, _)| [inp[0], (inp[1] & 31) | ((inp[2] & 0x7F) << 16), 0, 0])
+        .collect();
+    run_cases(&s_unsigned, &su_in, |backend, i, inp, got| {
+        let want = su_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: s_bfe_u32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
 }
 
 /// Lowers a wave32 compute program of 32 threads (with `validate`,
