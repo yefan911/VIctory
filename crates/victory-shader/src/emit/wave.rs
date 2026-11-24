@@ -2,7 +2,7 @@
 //! (or `s_nand_saveexec 0`) and the restore of the saved mask runs in every lane of the console's
 //! wave, the inactive ones included, which is how the compiler expands
 //! HLSL wave reductions and prefix sums (an identity put into the inactive
-//! lanes with `v_cndmask`, then DPP, `v_permlanex16` and `v_readlane`
+//! lanes with `v_cndmask`, then DPP, `v_permlane16`, `v_permlanex16` and `v_readlane`
 //! steps). A host lane that is elsewhere cannot run that code, so each
 //! section is simulated on the console's lanes with symbolic values, and a
 //! value it leaves is lowered by what it turned out to be: the reduction or
@@ -490,22 +490,29 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     })
                     .collect()
             }
-            ("v_permlanex16_b32", Some(a)) => {
-                // Lanes of each row read the other row of their half; lane
-                // i's pick is nibble i of {src2, src1}.
+            (n @ ("v_permlane16_b32" | "v_permlanex16_b32"), Some(a)) => {
+                // Lane i of a row picks nibble i of {src2, src1}: from its
+                // own row (permlane16) or from the other row of its half of
+                // 32 lanes (permlanex16). Only with every lane active: the
+                // opsel bits (fi, bound_ctrl) decide what an inactive lane
+                // reads.
                 let sel = |k: usize| match v.src.get(k) {
                     Some(&Operand::Const(c)) => crate::resource::inline(c),
                     Some(&Operand::Literal(x)) => Some(x),
                     _ => None,
                 };
                 match (sel(1), sel(2)) {
-                    (Some(s1), Some(s2)) => {
+                    (Some(s1), Some(s2)) if exec == all => {
                         let s = u64::from(s1) | u64::from(s2) << 32;
                         (0..wave)
                             .map(|l| {
-                                let other = (l & !31) | ((l & 16) ^ 16);
+                                let row = if n == "v_permlane16_b32" {
+                                    l & !15
+                                } else {
+                                    (l & !31) | ((l & 16) ^ 16)
+                                };
                                 let pick = (s >> (4 * (l & 15)) & 15) as u32;
-                                a[(other | pick) as usize]
+                                a[(row | pick) as usize]
                             })
                             .collect()
                     }
@@ -770,6 +777,50 @@ mod tests {
         assert_eq!(
             per_lane(&vec![red(u64::MAX); 64], u64::MAX),
             Some(Shape::Active(Op::AddU, x, m, 0))
+        );
+    }
+
+    /// Assembled with llvm-mc (gfx1030, wave32): a sum over all 32 lanes as
+    /// the console expands it, a DPP reduction of each row of 16, then each
+    /// row total read from lane 15 of its own row and of the other row.
+    const ROW_SUM_WORDS: [u32; 15] = [
+        0xBE80_3DC1, // s_or_saveexec_b32 s0, -1
+        0xD501_0001,
+        0x0002_0080, // v_cndmask_b32_e64 v1, 0, v0, s0
+        0x4A02_02FA,
+        0xFF01_6101, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:1
+        0x4A02_02FA,
+        0xFF01_6201, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:2
+        0x4A02_02FA,
+        0xFF01_6401, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:4
+        0x4A02_02FA,
+        0xFF01_6801, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:8
+        0xD777_0002,
+        0x0305_8301, // v_permlane16_b32 v2, v1, -1, -1
+        0xD778_0003,
+        0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1
+    ];
+
+    #[test]
+    fn permlane16_reads_the_lanes_own_row() {
+        let mut words = ROW_SUM_WORDS.to_vec();
+        words.extend([
+            0x4A08_0702, // v_add_nc_u32_e32 v4, v2, v3
+            0xBEFE_0300, // s_mov_b32 exec_lo, s0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 8).unwrap();
+        let insts = &p.blocks[0].insts;
+        let (saved, x) = (
+            insts[0].write(Reg::S(0)).unwrap(),
+            insts[1].read(Reg::V(0)).unwrap(),
+        );
+        let total = insts[8].write(Reg::V(4)).unwrap();
+        let found = sections(&p, 0);
+        assert_eq!(
+            found[&0].shapes.get(&total),
+            Some(&Shape::Active(Op::AddU, x, saved, 0))
         );
     }
 }
