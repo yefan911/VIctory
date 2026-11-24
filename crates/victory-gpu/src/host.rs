@@ -354,6 +354,110 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    /// A node of the device-removed data is a list by pointer or by name.
+    /// The name is what still matches when the runtime records another
+    /// object than the one we hold (the debug layer wraps ours), and a
+    /// different list or an unnamed node never matches.
+    #[test]
+    fn a_breadcrumb_node_is_found_by_pointer_or_by_name() {
+        let ours = [0x1000, 0x1008];
+        let name = list_name(7);
+        let is = |pointer, text| node_is_list(pointer, text, &ours, &name);
+        assert_eq!(name, "victory host list 7");
+        assert!(is(Some(0x1000), None));
+        assert!(is(Some(0x1008), Some("other")));
+        assert!(is(Some(0x9999), Some("victory host list 7")));
+        assert!(is(None, Some("victory host list 7")));
+        assert!(!is(Some(0x9999), Some("victory host list 70")));
+        assert!(!is(Some(0x9999), None));
+        assert!(!is(None, None));
+        // The debug layer appends its own note to the name we gave.
+        assert!(is(None, Some("victory host list 7 (debug layer indirect)")));
+        assert!(is(None, Some("victory host list 7 (x)")));
+        assert!(!is(
+            None,
+            Some("victory host list 70 (debug layer indirect)")
+        ));
+        assert!(!is(None, Some("victory host list 7 debug layer")));
+        assert!(!is(None, Some("victory host list 7(")));
+        assert!(is(None, Some("victory host list 7")));
+        assert_eq!(list_name(70), "victory host list 70");
+    }
+
+    /// The pointers of one list: the interface pointers it answers with
+    /// are all there, and another list's are not.
+    #[test]
+    fn a_list_knows_every_pointer_it_answers_with() {
+        // SAFETY: plain device and list creation on the software adapter.
+        unsafe {
+            let Ok(adapter) = warp_adapter() else { return };
+            let mut device: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                return;
+            }
+            let device = device.unwrap();
+            // An open list holds its allocator: one each.
+            let make = || -> ID3D12GraphicsCommandList {
+                let allocator: ID3D12CommandAllocator = device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .unwrap();
+                device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                    .unwrap()
+            };
+            let (a, b) = (make(), make());
+            let pointers = identities(&a);
+            assert!(pointers.contains(&(a.as_raw() as usize)));
+            let unknown = a.cast::<windows::core::IUnknown>().unwrap();
+            assert!(pointers.contains(&(unknown.as_raw() as usize)));
+            let command_list = a.cast::<ID3D12CommandList>().unwrap();
+            assert!(pointers.contains(&(command_list.as_raw() as usize)));
+            let other = identities(&b);
+            assert!(pointers.iter().all(|p| !other.contains(p)));
+            // As a node: the same object by any of its pointers; a node
+            // naming the other list by pointer and our name still matches.
+            let name = list_name(3);
+            let is = |pointer, text| node_is_list(pointer, text, &pointers, &name);
+            assert!(is(Some(command_list.as_raw() as usize), None));
+            assert!(!is(Some(b.as_raw() as usize), None));
+            assert!(is(Some(b.as_raw() as usize), Some(&name)));
+        }
+    }
+
+    /// A node as the runtime gives it, built by hand: `HostList::is_node`
+    /// reads the pointer and the copied name, and the name alone finds a
+    /// list the runtime records under another object.
+    #[test]
+    fn is_node_reads_the_name_the_runtime_copied() {
+        let Some(host) = host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        let mut wide: Vec<u16> = list_name(list.id).encode_utf16().collect();
+        wide.push(0);
+        let mut node = D3D12_AUTO_BREADCRUMB_NODE::default();
+        assert!(!list.is_node(&node), "an empty node is no list");
+        node.pCommandListDebugNameW = windows::core::PCWSTR(wide.as_ptr());
+        assert!(list.is_node(&node), "found by its name alone");
+        let mut other: Vec<u16> = list_name(list.id + 1).encode_utf16().collect();
+        other.push(0);
+        node.pCommandListDebugNameW = windows::core::PCWSTR(other.as_ptr());
+        assert!(!list.is_node(&node), "another list's name is no match");
+        // With the debug layer: our name and the layer's note, in either
+        // name field; and a list whose number only starts with ours is not it.
+        let note = std::ffi::CString::new(format!("{} (debug layer indirect)", list_name(list.id)))
+            .unwrap();
+        node.pCommandListDebugNameW = windows::core::PCWSTR::null();
+        node.pCommandListDebugNameA = note.as_ptr().cast();
+        assert!(
+            list.is_node(&node),
+            "found by its ANSI name with the layer's note"
+        );
+        let longer =
+            std::ffi::CString::new(format!("{}0 (debug layer indirect)", list_name(list.id)))
+                .unwrap();
+        node.pCommandListDebugNameA = longer.as_ptr().cast();
+        assert!(!list.is_node(&node), "a number that only starts with ours is no match");
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -383,6 +487,9 @@ pub(crate) struct HostList {
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// Which list this is, for the name that tells it apart in device-removed
+    /// data (see [`HostList::is_node`]).
+    id: u64,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
@@ -438,6 +545,58 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
         // SAFETY: a plain call on a live object.
         let _ = unsafe { object.SetName(&windows::core::HSTRING::from(text())) };
     }
+}
+
+/// The id of the next host list (see [`HostList::is_node`]).
+static NEXT_LIST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The name a host list gets with device-removed data on.
+fn list_name(id: u64) -> String {
+    format!("victory host list {id}")
+}
+
+/// The pointers one of our list objects answers to: its own and the one each
+/// interface a runtime may record it by gives (COM identity is the
+/// `IUnknown` one). Only our live object is queried: a node of the
+/// device-removed data may name a list that is long released, so its pointer
+/// is compared and never dereferenced.
+fn identities(list: &impl Interface) -> Vec<usize> {
+    let mut found = vec![list.as_raw() as usize];
+    let mut add = |pointer: Option<*mut core::ffi::c_void>| {
+        if let Some(pointer) = pointer {
+            found.push(pointer as usize);
+        }
+    };
+    add(list
+        .cast::<windows::core::IUnknown>()
+        .ok()
+        .map(|i| i.as_raw()));
+    add(list.cast::<ID3D12Object>().ok().map(|i| i.as_raw()));
+    add(list.cast::<ID3D12DeviceChild>().ok().map(|i| i.as_raw()));
+    add(list.cast::<ID3D12CommandList>().ok().map(|i| i.as_raw()));
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// Whether a node of the device-removed data is a list: by pointer, or by the
+/// name the runtime copied when the list was submitted. With the debug layer
+/// on, the object we hold is its wrapper and the runtime records another
+/// one, so no pointer of ours matches, and it appends its own note to our
+/// name ("victory host list 158 (debug layer indirect)"). The name matches
+/// exactly or followed by " (": never as the start of another number.
+fn node_is_list(
+    node_pointer: Option<usize>,
+    node_name: Option<&str>,
+    pointers: &[usize],
+    name: &str,
+) -> bool {
+    node_pointer.is_some_and(|p| pointers.contains(&p))
+        || node_name.is_some_and(|n| {
+            n == name
+                || n.strip_prefix(name)
+                    .is_some_and(|rest| rest.starts_with(" ("))
+        })
 }
 
 /// Upload chunks handed out front to back: the chunks, the one in use and
@@ -620,6 +779,8 @@ impl Host {
                 None,
             )?;
             prelude.Close()?;
+            let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
+            name(&list, || list_name(id));
             Ok(HostList {
                 allocator,
                 list,
@@ -630,6 +791,7 @@ impl Host {
                 rebind: false.into(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
+                id,
                 budget: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -943,19 +1105,47 @@ impl Host {
                     return text;
                 }
             };
-            // Every list's progress (done/count), in the runtime's order.
-            let mut progress = Vec::new();
+            // The nodes, oldest list first, and which run each is.
+            let mut nodes = Vec::new();
             let mut node = crumbs.pHeadAutoBreadcrumbNode;
             while let Some(p) = node.as_ref() {
-                let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
-                let ours = p.pCommandList.as_ref().map(|l| l.as_raw());
-                let index = runs.iter().position(|r| Some(r.list.as_raw()) == ours);
-                progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
+                nodes.push(p);
                 node = p.pNext;
             }
+            let index: Vec<Option<usize>> = nodes
+                .iter()
+                .map(|p| runs.iter().position(|r| r.is_node(p)))
+                .collect();
+            if let Some(last) = nodes.last()
+                && index.iter().all(Option::is_none)
+            {
+                let name = |w: windows::core::PCWSTR, a: *const u8| {
+                    let w = (!w.is_null()).then(|| w.to_string().unwrap_or_default());
+                    let a = (!a.is_null()).then(|| {
+                        std::ffi::CStr::from_ptr(a.cast())
+                            .to_string_lossy()
+                            .into_owned()
+                    });
+                    format!("{w:?}/{a:?}")
+                };
+                tracing::warn!(
+                    nodes = nodes.len(),
+                    last_pointer = ?last.pCommandList.as_ref().map(|l| l.as_raw()),
+                    last_names = %name(last.pCommandListDebugNameW, last.pCommandListDebugNameA),
+                    "no breadcrumb node named one of our lists"
+                );
+            }
+            // Every list's progress (done/count), in the runtime's order.
+            let progress: Vec<String> = nodes
+                .iter()
+                .zip(&index)
+                .map(|(p, index)| {
+                    let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
+                    format!("{done}/{} {index:?}", p.BreadcrumbCount)
+                })
+                .collect();
             text.push_str(&format!("; breadcrumbs (done/count, list) {progress:?}"));
-            let mut plain = crumbs.pHeadAutoBreadcrumbNode;
-            while let Some(p) = plain.as_ref() {
+            for (p, index) in nodes.iter().zip(&index) {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
                 if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
                     let history =
@@ -964,8 +1154,7 @@ impl Host {
                         "; a list stopped at command {done} of {} (op {})",
                         p.BreadcrumbCount, history[done as usize].0
                     ));
-                    let list = p.pCommandList.as_ref().map(|l| l.as_raw());
-                    let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
+                    let run = index.map(|i| runs[i]);
                     // The k-th marker command is the k-th note.
                     #[cfg(feature = "diagnostics")]
                     let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
@@ -992,7 +1181,6 @@ impl Host {
                         text.push_str(&format!(", its pipelines {pipelines:?}"));
                     }
                 }
-                plain = p.pNext;
             }
         }
         text
@@ -1150,6 +1338,28 @@ impl HostList {
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
         times.truncate(n);
         times
+    }
+
+    /// Whether `node` of the device-removed data (its breadcrumbs) is this
+    /// list.
+    fn is_node(&self, node: &D3D12_AUTO_BREADCRUMB_NODE) -> bool {
+        // SAFETY: only the pointer and the name text are read: the pointer is
+        // compared, never used, and the name is the runtime's copy.
+        let (pointer, wide, ansi) = unsafe {
+            (
+                node.pCommandList.as_ref().map(|l| l.as_raw() as usize),
+                (!node.pCommandListDebugNameW.is_null())
+                    .then(|| node.pCommandListDebugNameW.to_string().unwrap_or_default()),
+                (!node.pCommandListDebugNameA.is_null()).then(|| {
+                    std::ffi::CStr::from_ptr(node.pCommandListDebugNameA.cast())
+                        .to_string_lossy()
+                        .into_owned()
+                }),
+            )
+        };
+        let (pointers, name) = (identities(&self.list), list_name(self.id));
+        node_is_list(pointer, wide.as_deref(), &pointers, &name)
+            || node_is_list(None, ansi.as_deref(), &pointers, &name)
     }
 
     pub(crate) fn close(&self) {
