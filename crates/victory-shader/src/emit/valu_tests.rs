@@ -1453,3 +1453,94 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
+/// RDNA2 ignores VOP3 `op_sel` on 16-bit compares (reading the low halves
+/// regardless), while non-compare 16-bit ops such as `v_add_nc_u16` honour it.
+#[test]
+fn cmp16_ignores_op_sel_as_rdna2_does() {
+    let vop3_opsel = |op: u16, dst: u8, s0: u16, s1: u16, opsel: u8| -> [u32; 2] {
+        let [w0, w1] = vop3(op, dst, s0, s1, 0);
+        [w0 | (u32::from(opsel) << 11), w1]
+    };
+
+    // High and low halves give opposite outcomes for every non-zero source op_sel.
+    let f16_cases: &[([u32; 4], u32)] = &[
+        // hi 2.0 vs 1.0, lo 1.0 < 1.5 -> true only when both read the low half
+        ([0x4000_3C00, 0x3C00_3E00, 0, 0], 1),
+        // hi 1.0 vs 3.0, lo 2.0 < 1.5 -> false only when both read the low half
+        ([0x3C00_4000, 0x4200_3E00, 0, 0], 0),
+    ];
+    let u16_cases: &[([u32; 4], u32)] = &[
+        // hi 10 vs 1, lo 1 < 2 -> true
+        ([0x000A_0001, 0x0001_0002, 0, 0], 1),
+        // hi 1 vs 20, lo 10 < 2 -> false
+        ([0x0001_000A, 0x0014_0002, 0, 0], 0),
+    ];
+    let i16_cases: &[([u32; 4], u32)] = &[
+        // hi 1 vs -2, lo -1 < 0 -> true
+        ([0x0001_FFFF, 0xFFFE_0000, 0, 0], 1),
+        // hi -2 vs 2, lo 1 < -1 -> false
+        ([0xFFFE_0001, 0x0002_FFFF, 0, 0], 0),
+    ];
+
+    let mut cmp_shaders = Vec::new();
+    for (op, what, cases) in [
+        (0x0c9u16, "v_cmp_lt_f16", f16_cases),
+        (0x0a9, "v_cmp_lt_u16", u16_cases),
+        (0x089, "v_cmp_lt_i16", i16_cases),
+    ] {
+        for opsel in [0b0001u8, 0b0010, 0b0011] {
+            let mut body = vop3_opsel(op, 6, vgpr(1), vgpr(2), opsel).to_vec();
+            body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(6)));
+            cmp_shaders.push((what, opsel, build_valu_cs(&body), cases));
+        }
+    }
+
+    // v_cmpx_lt_f16_e64 (0x0d9) writing EXEC directly also ignores op_sel.
+    let [w0, w1] = vop3_opsel(0x0d9, 126, vgpr(1), vgpr(2), 0b0001);
+    let cmpx = build_valu_cs(&[
+        s_mov_b32(6, 126),    // save exec_lo
+        vop1(0x001, 0, 0x80), // v0 = 0
+        w0,
+        w1,                   // v_cmpx_lt_f16_e64 exec_lo, v1, v2 op_sel:[1,0]
+        vop1(0x001, 0, 0x81), // v0 = 1 if active
+        s_mov_b32(126, 6),    // restore exec_lo
+    ]);
+
+    // Control: v_add_nc_u16 (0x303) still honours op_sel.
+    let [w0, w1] = vop3_opsel(0x303, 0, vgpr(1), vgpr(2), 0b0001);
+    let add_hi = build_valu_cs(&[vop1(0x001, 0, 0x80), w0, w1]);
+
+    for (what, opsel, shader, cases) in &cmp_shaders {
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+        run_cases(shader, &inputs, |backend, i, inp, got| {
+            let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend}: {what} opsel={opsel:#b} ({:#010x}, {:#010x}) = {got}, want {want}",
+                inp[0], inp[1],
+            );
+        });
+    }
+
+    let f16_in: Vec<[u32; 4]> = f16_cases.iter().map(|c| c.0).collect();
+    run_cases(&cmpx, &f16_in, |backend, i, inp, got| {
+        let want = f16_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cmpx_lt_f16 opsel=0b1 ({:#010x}, {:#010x}) = {got}, want {want}",
+            inp[0], inp[1],
+        );
+    });
+
+    run_cases(
+        &add_hi,
+        &[[0x000A_0001, 0x0014_0002, 0, 0]],
+        |backend, _, _, got| {
+            assert_eq!(
+                got, 12,
+                "{backend}: v_add_nc_u16 op_sel:[1,0] = {got}, want 12"
+            );
+        },
+    );
+}
