@@ -422,6 +422,8 @@ impl Layout {
             let mut sizes = vec![];
             for i in 0..d.mips {
                 let (w, h) = padded(i);
+                // Matches AMD addrlib `Gfx10Lib::IsInMipTail()`: thick 3D depth
+                // is handled by depth slabs rather than restricting tail entry.
                 if w <= fixed[0] && h <= fixed[1] && d.mips - i <= max_in_tail {
                     first_tail_mip = i;
                     slice_size += block_bytes / u64::from(block[2]);
@@ -1031,6 +1033,11 @@ mod tests {
                 depth: 16,
                 ..desc(64, 32, 7, 4, Swizzle::SW_4KB_S)
             },
+            Desc {
+                dimension: Dimension::Tex3d,
+                depth: 64,
+                ..desc(16, 16, 4, 4, Swizzle::SW_64KB_S)
+            },
         ];
         for d in cases {
             let l = Layout::new(&d).unwrap();
@@ -1151,6 +1158,85 @@ mod tests {
         assert_eq!(l.mips[2].offset, 4096);
         assert_eq!(l.mips[1].offset, 8192);
         assert_eq!(l.mips[0].offset, 8192 + 16384);
+    }
+
+    #[test]
+    fn thick_tail_matches_addrlib_width_height_predicate() {
+        for (w, h, d, mips, swizzle, first_tail) in [
+            (16, 32, 16, 4, Swizzle::SW_64KB_S, 0),
+            (17, 32, 16, 4, Swizzle::SW_64KB_S, 1),
+            (16, 33, 16, 4, Swizzle::SW_64KB_S, 1),
+            (16, 16, 64, 4, Swizzle::SW_64KB_S, 0),
+            (16, 16, 65, 4, Swizzle::SW_64KB_S, 0),
+            (16, 16, 64, 2, Swizzle::SW_64KB_S, 0),
+            (8, 8, 17, 4, Swizzle::SW_4KB_S, 0),
+        ] {
+            let d = Desc {
+                dimension: Dimension::Tex3d,
+                depth: d,
+                ..desc(w, h, mips, 4, swizzle)
+            };
+            let l = Layout::new(&d).unwrap();
+            assert!(l.thick);
+            assert_eq!(l.first_tail_mip, first_tail, "{d:?}");
+            for (i, mip) in l.mips.iter().enumerate() {
+                assert_eq!(
+                    mip.tail.is_some(),
+                    i >= first_tail as usize,
+                    "{d:?} mip {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn thick_tail_deep_narrow_3d_matches_addrlib_slabs() {
+        let l = Layout::new(&Desc {
+            dimension: Dimension::Tex3d,
+            depth: 64,
+            ..desc(16, 16, 4, 4, Swizzle::SW_64KB_S)
+        })
+        .unwrap();
+        let block_bytes = 65536;
+        assert_eq!(l.block, [32, 32, 16]);
+        assert_eq!(l.first_tail_mip, 0);
+        assert_eq!(
+            (l.slices, l.slice_size, l.size),
+            (4, block_bytes, 4 * block_bytes)
+        );
+        for (i, mip) in l.mips.iter().enumerate() {
+            assert_eq!(mip.offset, 0, "mip {i}");
+            assert!(mip.tail.is_some(), "mip {i}");
+        }
+        assert_eq!(l.offset(0, 0, 0, 16), Ok(block_bytes + 32768));
+    }
+
+    #[test]
+    fn thin_tails_keep_array_and_volume_layouts() {
+        for (dimension, swizzle) in [
+            (Dimension::Tex2d, Swizzle::SW_64KB_S),
+            (Dimension::Tex3d, Swizzle::SW_64KB_R_X),
+        ] {
+            let l = Layout::new(&Desc {
+                dimension,
+                depth: 64,
+                ..desc(16, 16, 4, 4, swizzle)
+            })
+            .unwrap();
+            assert!(!l.thick);
+            assert_eq!(l.block, [128, 128, 1]);
+            assert_eq!(l.first_tail_mip, 0);
+            assert_eq!((l.slices, l.slice_size, l.size), (64, 65536, 64 * 65536));
+            for (i, mip) in l.mips.iter().enumerate() {
+                let depth = if dimension == Dimension::Tex3d {
+                    64 >> i
+                } else {
+                    1
+                };
+                assert_eq!((mip.depth, mip.depth_pitch, mip.offset), (depth, 1, 0));
+                assert_eq!(mip.tail.unwrap().offset, 32768 >> i);
+            }
+        }
     }
 
     #[test]
