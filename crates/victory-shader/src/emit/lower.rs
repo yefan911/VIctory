@@ -2441,6 +2441,35 @@ impl<'a> Lower<'a> {
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
     }
 
+    /// The high dword of a 24-bit product, using only i32 arithmetic.
+    fn mul_hi_24(&mut self, a: V, b: V, signed: bool) -> V {
+        let c = self.cur;
+        let mask = self.s.m.i32(0xffff);
+        let k8 = self.s.m.i32(8);
+        let k16 = self.s.m.i32(16);
+        let k24 = self.s.m.i32(24);
+        let shift = if signed { Bin::AShr } else { Bin::LShr };
+        let a_lo = self.s.m.bin(c, Bin::And, a, mask);
+        let b_lo = self.s.m.bin(c, Bin::And, b, mask);
+        // Discard the unused top byte and extract bits [23:16] with the
+        // requested signedness. The low limbs are always unsigned.
+        let a_hi = self.s.m.bin(c, Bin::Shl, a, k8);
+        let a_hi = self.s.m.bin(c, shift, a_hi, k24);
+        let b_hi = self.s.m.bin(c, Bin::Shl, b, k8);
+        let b_hi = self.s.m.bin(c, shift, b_hi, k24);
+
+        let low = self.s.m.bin(c, Bin::Mul, a_lo, b_lo);
+        let carry = self.s.m.bin(c, Bin::LShr, low, k16);
+        let cross_a = self.s.m.bin(c, Bin::Mul, a_hi, b_lo);
+        let cross_b = self.s.m.bin(c, Bin::Mul, a_lo, b_hi);
+        // Both cross products and the carry fit in i32 when summed.
+        let middle = self.s.m.bin(c, Bin::Add, cross_a, cross_b);
+        let middle = self.s.m.bin(c, Bin::Add, middle, carry);
+        let middle_hi = self.s.m.bin(c, shift, middle, k16);
+        let high = self.s.m.bin(c, Bin::Mul, a_hi, b_hi);
+        self.s.m.bin(c, Bin::Add, high, middle_hi)
+    }
+
     /// `0 × anything = 0`, as in D3D9.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
@@ -6990,6 +7019,10 @@ impl<'a> Lower<'a> {
             "v_mul_hi_u32" | "v_mul_hi_i32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 self.mul_hi(a, b, name == "v_mul_hi_i32")
+            }
+            "v_mul_hi_i32_i24" | "v_mul_hi_u32_u24" => {
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                self.mul_hi_24(a, b, name == "v_mul_hi_i32_i24")
             }
             "v_alignbit_b32" | "v_alignbyte_b32" => {
                 // The low dword of {a, b} >> shift.

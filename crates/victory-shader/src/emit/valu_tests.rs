@@ -41,6 +41,11 @@ const fn vop1(op: u16, vdst: u8, src0: u16) -> u32 {
     0x7E00_0000 | (vdst as u32) << 17 | (op as u32) << 9 | (src0 as u32 & 0x1FF)
 }
 
+/// VOP2 `op vdst, src0, vsrc1`.
+const fn vop2(op: u16, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+    (op as u32) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+}
+
 /// VOP3 `op vdst, src0, src1, src2` (no modifiers).
 const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
     [
@@ -1310,6 +1315,45 @@ fn signed_64_bit_operands_sign_extend_their_literal() {
     // s_ashr_i64 s[6:7], -100, 4; v_mov_b32 v0, s7: the high dword.
     let ashr = [sop2(0x23, 6, 255, 0x84), MINUS_100, vop1(0x001, 0, sgpr(7))];
     check("s_ashr_i64", &ashr, &[([0; 4], u32::MAX)]);
+}
+
+#[test]
+fn mul_hi_24_signed_and_unsigned_match_rdna2() {
+    // Inputs, signed high dword, unsigned high dword.
+    let cases = [
+        ([0xff_ffff, 0xff_ffff, 0, 0], 0, 0x0000_ffff),
+        ([0xff_ff00, 0xff_ffff, 0, 0], 0, 0x0000_fffe),
+        ([0x80_0000, 0x80_0000, 0, 0], 0x0000_4000, 0x0000_4000),
+        ([0x7f_ffff, 0x7f_ffff, 0, 0], 0x0000_3fff, 0x0000_3fff),
+        ([0x80_0000, 0x7f_ffff, 0, 0], 0xffff_c000, 0x0000_3fff),
+        ([0xaa80_0000, 0x557f_ffff, 0, 0], 0xffff_c000, 0x0000_3fff),
+        ([0xff_ffff, 1, 0, 0], 0xffff_ffff, 0),
+        ([0x01_ffff, 0x00_8001, 0, 0], 1, 1), // Carry from the low limbs.
+        ([0xff00_0000, 0xa5ff_ffff, 0, 0], 0, 0),
+    ];
+    let inputs = cases.map(|(inputs, _, _)| inputs);
+    for (name, op, signed) in [
+        ("v_mul_hi_i32_i24", 0x00a, true),
+        ("v_mul_hi_u32_u24", 0x00c, false),
+    ] {
+        let vop2_body = [vop2(op, 0, vgpr(1), 2)];
+        let vop3_body = vop3(op + 0x100, 0, vgpr(1), vgpr(2), 0);
+        for (encoding, body) in [("VOP2", &vop2_body[..]), ("VOP3", &vop3_body[..])] {
+            let shader = build_valu_cs(body);
+            let container = crate::Container::parse(&shader.dxil).unwrap();
+            let features = container.part(crate::FourCC::SFI0).unwrap();
+            let flags = u64::from_le_bytes(features.data.try_into().unwrap());
+            assert_eq!(flags & 0x8000, 0, "{name} {encoding} requires INT64");
+            run_cases(&shader, &inputs, |backend, i, [a, b, ..], got| {
+                let (_, signed_high, unsigned_high) = cases[i];
+                let want = if signed { signed_high } else { unsigned_high };
+                assert_eq!(
+                    got, want,
+                    "{backend}: {name} {encoding}({a:#010x}, {b:#010x})"
+                );
+            });
+        }
+    }
 }
 
 #[test]
