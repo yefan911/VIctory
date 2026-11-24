@@ -652,11 +652,12 @@ mod tests {
     }
 
     /// A wave64 compute program that writes only EXEC's high dword
-    /// (`s_mov_b32 exec_hi, 0`) before a vector instruction. The new mask is
+    /// (`s_mov_b32 exec_hi, 0`) before a vector instruction. The new mask was
     /// opaque and keyed by the unchanged low dword, so building its lane bit
     /// needed the mask's own value: lowering recursed until the stack
     /// overflowed, which takes the whole process down (found by
-    /// random-input testing). Now the instruction fails like any other that
+    /// random-input testing). Now that low dword, seen with two high
+    /// dwords, has no mask, and the instruction fails like any other that
     /// cannot be expressed: its result is missing, and only a side effect
     /// that uses it would stop the translation.
     #[test]
@@ -684,6 +685,99 @@ mod tests {
         if let Err(e) = emit(&c, &native, &p, &st, &io, &res) {
             assert!(e.to_string().contains("its own value"), "{e}");
         }
+    }
+
+    /// A wave64 compute program: `body`, then a store of v1 to a UAV.
+    fn stores_v1(body: &[u32]) -> Result<(), ShaderError> {
+        use crate::native::RootParam;
+        use crate::{ResourceType, RootType, UsedResource};
+        // s_mov_b32 s1, 0; s_load_dwordx4 s[8:11], s[0:1], 0
+        let mut words = vec![0xBE81_0380, 0xF408_0200, 0xFA00_0000];
+        words.extend_from_slice(body);
+        // v_lshlrev_b32 v3, 2, v0; buffer_store_dword v1, v3, s[8:11], 0 offen;
+        // s_endpgm
+        words.extend_from_slice(&[0x3406_0082, 0xE070_1000, 0x8002_0103, 0xBF81_0000]);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 4,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2,
+                threads: [64, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let container = crate::dxbc::build(&[]);
+        let c = Container::parse(&container).unwrap();
+        emit(&c, &native, &p, &st, &io, &res).map(|_| ())
+    }
+
+    /// The high dword of a wave64 mask rewritten alone (`s_mov_b32 vcc_hi`
+    /// or `exec_hi`): lanes 32-63 took the mask the low dword was first
+    /// written with (the compare's, EXEC's on entry). Now the store refuses;
+    /// without the write it translates.
+    #[test]
+    fn a_mask_whose_high_dword_is_rewritten_is_refused() {
+        // v_cmp_eq_u32 vcc, 0, v0; v_mov_b32 v2, 11; v_cndmask_b32 v1, 0, v2, vcc
+        let select = [0x7D84_0080, 0x7E04_028B, 0x0202_0480];
+        // The same with v_add_co_ci_u32 v1, vcc, 0, v2, vcc.
+        let carry = [0x7D84_0080, 0x7E04_028B, 0x5002_0480];
+        // v_mov_b32 v1, 7
+        let mov = [0x7E02_0287];
+        for body in [&select[..], &carry, &mov] {
+            stores_v1(body).unwrap();
+        }
+        // s_mov_b32 vcc_hi, 0 after the compare.
+        let select_hi = [0x7D84_0080, 0xBEEB_0380, 0x7E04_028B, 0x0202_0480];
+        let carry_hi = [0x7D84_0080, 0xBEEB_0380, 0x7E04_028B, 0x5002_0480];
+        // s_mov_b32 exec_hi, 0; v_mov_b32 v1, 7, then the same after
+        // s_mov_b64 s[2:3], exec.
+        let exec_hi = [0xBEFF_0380, 0x7E02_0287];
+        let exec_hi_saved = [0xBE82_047E, 0xBEFF_0380, 0x7E02_0287];
+        for body in [&select_hi[..], &carry_hi, &exec_hi, &exec_hi_saved] {
+            assert!(stores_v1(body).is_err(), "{body:x?}");
+        }
+    }
+
+    /// A carry-in reading a join of compares after a divergent branch. A
+    /// lane that skipped the inner compare has VCC clear there (VOPC clears
+    /// inactive lanes), not the first compare's bit, so the join is no
+    /// per-lane phi: lowering refuses it.
+    #[test]
+    fn a_carry_in_from_a_divergent_join_is_refused() {
+        let body = [
+            0x7E04_028B, // v_mov_b32 v2, 11
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE82_376A, // s_andn1_saveexec_b64 s[2:3], vcc
+            0xBF88_0001, // s_cbranch_execz 1
+            0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
+            0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+            0x5002_0480, // v_add_co_ci_u32 v1, vcc, 0, v2, vcc
+        ];
+        let e = stores_v1(&body).unwrap_err().to_string();
+        assert!(e.contains("a carry-in from an untracked mask"), "{e}");
     }
 
     /// A pixel shader writing a constant colour.

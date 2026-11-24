@@ -453,15 +453,18 @@ pub struct Structured {
     /// Per block: what holds in every lane that enters it (over forward
     /// edges; a loop header forgets what its loop redefines).
     pub reach: Vec<Bool>,
-    /// The lane's bit of each lane-mask value, by its low dword's value.
+    /// The lane's bit of each lane-mask value, by its low dword's value;
+    /// none for a low dword read with two high dwords.
     pub masks: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
-    /// Wave64 masks: low dword's value by the high dword's.
+    /// Wave64 masks: low dword's value by the high dword's; none for a
+    /// split low dword, as in `masks`.
     pub highs: HashMap<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
     /// they are written: every such lane reaches the writing block, so a
-    /// ballot there gives the mask as data.
+    /// ballot there gives the mask as data. No split low dword, as in
+    /// `masks`.
     pub active: HashSet<Value>,
     /// `v_readlane_b32` results of a constant lane: the SGPR value that
     /// `v_writelane_b32` spilled to that lane, the same along every path.
@@ -533,6 +536,9 @@ struct Lanes<'a> {
     masks: Map<Key, Bool>,
     /// Other values read as masks: constants, uniform selects, opaque ones.
     other: Map<Key, Bool>,
+    /// Pairs read as masks that `mask` does not see: carry-ins, and pairs
+    /// joins take over back edges.
+    seen: Vec<Key>,
     /// For branches: SCC of a mask operation ("some lane is set") as the
     /// lane's own bit.
     scc_lane: Map<Value, Bool>,
@@ -607,6 +613,7 @@ impl<'a> Lanes<'a> {
             b: Bools::new(),
             masks: Map::default(),
             other: Map::default(),
+            seen: Vec::new(),
             scc_lane: Map::default(),
             joins: Vec::new(),
             first: vec![Bool::FALSE; blocks.len()],
@@ -685,6 +692,7 @@ impl<'a> Lanes<'a> {
         self.b = Bools::new();
         self.masks.clear();
         self.other.clear();
+        self.seen.clear();
         self.scc_lane.clear();
         self.joins.clear();
         self.first.fill(Bool::FALSE);
@@ -867,6 +875,26 @@ impl<'a> Lanes<'a> {
         if self.b.overflow {
             return Err(TOO_LARGE);
         }
+        // Exports go by low dword. A low dword read with two high dwords
+        // (one rewritten alone) names no one mask: it is left out, so
+        // lowering refuses what reads it instead of taking the other
+        // pair's lanes 32-63. Not where the low dword holds a number: see
+        // the shortcut in `mask`.
+        let (mut high, mut split) = (Map::default(), HashSet::new());
+        let keys = self.masks.keys().chain(self.other.keys());
+        for &(lo, hi) in keys.chain(&self.seen) {
+            if *high.entry(lo).or_insert(hi) != hi {
+                split.insert(lo);
+            }
+        }
+        // Exact pairs stay right when a low dword is split.
+        let paired_masks = if self.p.wave64 {
+            self.masks.clone()
+        } else {
+            Map::default()
+        };
+        self.masks.retain(|k, _| !split.contains(&k.0));
+        self.active.retain(|lo| !split.contains(lo));
         Ok(Structured {
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
@@ -875,7 +903,7 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            paired_masks,
             active: self.active,
             restored: self.restored.into_iter().collect(),
             discards: self
@@ -949,6 +977,12 @@ impl<'a> Lanes<'a> {
                     })
                 };
                 let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
+                // shortcut: the atom names the pair by its low dword, and
+                // lowering takes the high dword written beside it. For halves
+                // written apart (two `s_mov_b32`) lanes 32-63 are wrong unless
+                // lowering has no value for the low dword (EXEC, compares)
+                // and refuses. Give the atom both dwords when such code
+                // turns up.
                 let m = m.unwrap_or_else(|| {
                     let born = self.born(k.0);
                     self.b.atom(Atom::Opaque(k.0), born)
@@ -995,6 +1029,8 @@ impl<'a> Lanes<'a> {
                 derived |= d;
                 let e = self.edge(self.first[q], q, taken);
                 forward.push((e, m));
+            } else {
+                self.seen.push(a);
             }
         }
         if forward.len() == args.len()
@@ -1230,13 +1266,19 @@ impl<'a> Lanes<'a> {
                     l.active.insert(k.0);
                 };
                 // A select reads a mask nothing else may: a join of compare
-                // results is resolved here, as for EXEC.
-                if name == "v_cndmask_b32"
+                // results is resolved here, as for EXEC. A carry-in is only
+                // recorded for `finish`: resolving its join would turn a
+                // refusal into a per-lane phi, wrong after a divergent branch.
+                if (name == "v_cndmask_b32" || name.contains("_co_ci_"))
                     && let Some(&Operand::Scalar { code, .. }) = v.src.get(2)
                     && code != NULL
                     && let Some(k) = self.key(|r| inst.read(r), code)
                 {
-                    self.mask(k);
+                    if name == "v_cndmask_b32" {
+                        self.mask(k);
+                    } else {
+                        self.seen.push(k);
+                    }
                 }
                 if name.starts_with("v_cmpx") {
                     if let Some(k) = self.key(|r| inst.write(r), EXEC) {
@@ -1627,6 +1669,57 @@ mod tests {
         };
         assert!(matches!(s.bools.support(when)[..], [Atom::Uniform(_)]));
         assert_eq!(guarded(&s), 0);
+    }
+
+    #[test]
+    fn a_mask_whose_high_dword_is_rewritten_is_not_the_compare() {
+        for reader in [
+            0x0202_0480, // v_cndmask_b32 v1, 0, v2, vcc
+            0x5002_0480, // v_add_co_ci_u32 v1, vcc, 0, v2, vcc
+        ] {
+            let p = build(
+                &[
+                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                    0xBEEB_0380, // s_mov_b32 vcc_hi, 0
+                    reader,
+                    S_ENDPGM,
+                ],
+                true,
+            );
+            let s = structure(&p).unwrap();
+            let lo = p.blocks[0].insts[2].read(Reg::S(VCC)).unwrap();
+            assert_eq!(p.blocks[0].insts[0].write(Reg::S(VCC)), Some(lo));
+            // The reader sees (compare low dword, 0): lanes 32-63 are clear.
+            // The mask exported for that low dword must not be the compare.
+            assert_ne!(
+                s.masks.get(&lo).and_then(|&m| s.bools.node(m)),
+                Some((Atom::Lane(lo), Bool::FALSE, Bool::TRUE)),
+                "{reader:#x}: vcc_hi was zeroed after the compare"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mask_joined_over_a_back_edge_with_a_rewritten_high_dword_is_not_the_compare() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0x0202_0480, // 4: v_cndmask_b32 v1, 0, v2, vcc
+                0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+                0xBEEB_0380, // s_mov_b32 vcc_hi, 0
+                0xBF85_FFFC, // s_cbranch_scc1 -> 4
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        // The select reads the loop header's join; over the back edge it
+        // takes (compare low dword, 0), which only the join sees.
+        let lo = p.blocks[1].insts[1].write(Reg::S(VCC)).unwrap();
+        assert_ne!(
+            s.masks.get(&lo).and_then(|&m| s.bools.node(m)),
+            Some((Atom::Lane(lo), Bool::FALSE, Bool::TRUE))
+        );
     }
 
     #[test]
