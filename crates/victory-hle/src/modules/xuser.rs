@@ -97,6 +97,11 @@ extern "system" fn compare(_: This, a: Handle, b: Handle) -> i32 {
     i32::from(a != b)
 }
 
+/// The current HLE supports one offline local user.
+extern "system" fn get_max_users(_: This, out: *mut u32) -> HRESULT {
+    put(out, 1)
+}
+
 /// The async provider for adding a user: done at once, the result is a
 /// handle.
 extern "system" fn add_provider(op: u32, data: *const ProviderData) -> HRESULT {
@@ -267,8 +272,8 @@ extern "system" fn find_for_device(_: This, _device: *const c_void, _: *mut Hand
     USER_NOT_FOUND
 }
 
-// Unset slots (no title seen calls them): maximum users, gamer pictures,
-// the UTF-16 token calls, issue resolution.
+// Unset slots (no title seen calls them): gamer pictures, the UTF-16
+// token calls, issue resolution.
 static VTABLE: Methods<35> = Methods([
     missing::<0> as *const (),             // 0x00 QueryInterface
     add_ref as *const (),                  // 0x08 AddRef
@@ -276,7 +281,7 @@ static VTABLE: Methods<35> = Methods([
     duplicate as *const (),                // 0x18
     close as *const (),                    // 0x20
     compare as *const (),                  // 0x28
-    missing::<6> as *const (),             // 0x30 maximum users
+    get_max_users as *const (),            // 0x30 maximum users
     add_async as *const (),                // 0x38
     add_result as *const (),               // 0x40
     get_local_id as *const (),             // 0x48
@@ -346,6 +351,21 @@ mod tests {
                 assert_eq!(&name[..used], expected, "component {component}");
             }
         }
+    }
+
+    #[test]
+    fn maximum_users_reports_the_single_offline_user() {
+        type GetMaxUsers = extern "system" fn(This, *mut u32) -> HRESULT;
+        let get_max_users = slot::<GetMaxUsers>(&OBJECT, 0x30);
+        let this: This = &OBJECT;
+        let mut max_users = 0;
+
+        assert_eq!(get_max_users(this, &mut max_users), S_OK);
+        assert_eq!(max_users, 1);
+        assert_eq!(
+            get_max_users(this, std::ptr::null_mut()),
+            xasync::E_INVALIDARG
+        );
     }
 
     #[test]
