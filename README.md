@@ -143,6 +143,20 @@ info and above).
 
 ## Debugging
 
+If the title presents one or two black frames and exits with `0x80000003`,
+check the archive files before investigating rendering. The loader's import
+report only counts bindings, so it can report zero missing imports with a
+damaged archive. Check the SHA-256 of the files your run actually uses against
+a known-good copy of the **same build**. For example, in PowerShell:
+
+```powershell
+Get-FileHash -Algorithm SHA256 -LiteralPath 'C:\path\to\title\anim.rpf'
+```
+
+If a hash differs, restore that file from your verified backup and rerun with
+the same build of VIctory and the same options. A breakpoint can have other
+causes. Include the archive verification outcome in your test report.
+
 A release build has no debugging aids. Build them in with
 
 ```powershell
