@@ -1452,7 +1452,21 @@ pub(crate) fn take_counts() -> (u64, u64) {
 /// A GPU wait for a memory value `(address, comparison, reference, ...)`.
 /// Lists run one after another and to completion, so a value another queue
 /// or the CPU has to write first cannot be waited for; nothing to do.
-extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _reference: u64) {}
+extern "system" fn wait32(
+    _list: This, _address: u64, _comparison: u32, _reference: u32, _mask: u32, _flags: u32,
+) {
+    #[cfg(feature = "diagnostics")]
+    tracing::trace!(target: "victory_gpu::sync_wait", guest_list = ?_list, address = _address,
+        comparison = _comparison, reference = _reference, mask = _mask, flags = _flags,
+        bytes = 4, "command-list memory wait requested");
+}
+
+extern "system" fn wait64(_list: This, _address: u64, _comparison: u32, _reference: u64, _flags: u32) {
+    #[cfg(feature = "diagnostics")]
+    tracing::trace!(target: "victory_gpu::sync_wait", guest_list = ?_list, address = _address,
+        comparison = _comparison, reference = _reference, flags = _flags,
+        bytes = 8, "command-list memory wait requested");
+}
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
@@ -1555,8 +1569,8 @@ const METHODS: [(usize, *const ()); 52] = [
     (68, ignored_state as *const ()),             // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
-    (71, wait_value as *const ()),                // 0x238, 32 bits
-    (72, wait_value as *const ()),                // 0x240, 64 bits
+    (71, wait32 as *const ()),                    // 0x238, 32 bits
+    (72, wait64 as *const ()),                    // 0x240, 64 bits
     (73, ignored_state as *const ()),             // 0x248 pixel shader depth order
     (83, copy_texture_region_x as *const ()),     // 0x298
     (84, copy_resource_x as *const ()),           // 0x2a0

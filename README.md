@@ -175,6 +175,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | Variable | Effect |
 |----------|--------|
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
+| `VICTORY_LOG=victory_gpu::sync_wait=trace,victory_gpu::sync_write=trace` | requested command-list memory waits and their constant-value producers at recording, submission, and storage in guest memory |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |

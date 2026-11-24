@@ -161,14 +161,18 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
-extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
+extern "system" fn signal(_queue: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(feature = "diagnostics")]
+    tracing::trace!(target: "victory_gpu::sync_wait", queue = ?_queue, ?fence, value, "queue signal requested");
     crate::fence::signal(fence, value)
 }
 /// Nothing runs on the queue, so waiting for a fence never blocks it.
-extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
+extern "system" fn wait(_queue: This, fence: This, _value: u64) -> HRESULT {
+    #[cfg(feature = "diagnostics")]
+    tracing::trace!(target: "victory_gpu::sync_wait", queue = ?_queue, ?fence, value = _value, "queue wait requested");
     if fence.is_null() { E_INVALIDARG } else { S_OK }
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
