@@ -342,10 +342,12 @@ fn refuse(file: &str) {
     static REFUSED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let file = file.to_ascii_lowercase();
     let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
-    if !refused.contains(&file) {
-        tracing::warn!(dll = file, "a host DLL outside the host policy: refused");
-        refused.push(file);
+    if refused.contains(&file) {
+        return;
     }
+    refused.push(file.clone());
+    drop(refused);
+    tracing::warn!(dll = file, from = %host::callers(), "a host DLL outside the host policy: refused");
 }
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;

@@ -25,8 +25,14 @@ pub fn run(
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
+    let title_dir = exe.parent().unwrap_or(Path::new("."));
     match victory_game::identify(&hash) {
-        Some(build) => println!("build          {} ({hash})", build.label),
+        Some(build) => {
+            println!("build          {} ({hash})", build.label);
+            if execute {
+                check_startup_archive(&title_dir.join(build.startup_archive))?;
+            }
+        }
         None => println!("build          unknown ({hash})"),
     }
 
@@ -46,7 +52,6 @@ pub fn run(
         HostPolicy::default()
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
-    let title_dir = exe.parent().unwrap_or(Path::new("."));
     // A missing manifest leaves id 0 and no storage quota.
     let manifest =
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
@@ -125,6 +130,27 @@ pub fn run(
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
+    Ok(())
+}
+
+#[cfg(windows)]
+fn check_startup_archive(path: &Path) -> Result<()> {
+    use std::io::Read;
+
+    let mut magic = [0; 4];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .with_context(|| {
+            format!(
+                "Cannot read startup archive {}. Check that the file from your package is present and readable.",
+                path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        magic == *b"9FPR",
+        "Invalid RPF9 header in {}. Restore the startup archive from your package.",
+        path.display()
+    );
     Ok(())
 }
 
