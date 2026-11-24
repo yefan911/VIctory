@@ -88,17 +88,27 @@ pub struct SpaceInfo {
 }
 
 fn used_bytes(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .map(|e| match e.metadata() {
-            Ok(m) if m.is_dir() => used_bytes(&e.path()),
-            Ok(m) => m.len(),
-            Err(_) => 0,
-        })
-        .sum()
+    let mut pending = vec![dir.to_owned()];
+    let mut used = 0;
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                used += entry.metadata().map_or(0, |metadata| metadata.len());
+            }
+        }
+    }
+    used
 }
 
 /// What the host disk under `dir` has free (unlimited if unknown).
@@ -385,6 +395,28 @@ mod tests {
         // A null block starts no call and reads no result.
         assert_eq!(prompt(this, 1, std::ptr::null_mut()), E_INVALIDARG);
         assert_eq!(outcome(this, std::ptr::null_mut()), E_INVALIDARG);
+    }
+
+    #[test]
+    fn used_bytes_counts_nested_files_without_following_directory_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("save.dat"), [0u8; 17]).unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.path(), nested.join("cycle")).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::symlink_dir;
+            // Symlink creation can be disabled on Windows without elevation.
+            // When available, this also verifies the self-referential case.
+            if symlink_dir(dir.path(), nested.join("cycle")).is_err() {
+                return;
+            }
+        }
+
+        assert_eq!(used_bytes(dir.path()), 17);
     }
 
     #[test]
