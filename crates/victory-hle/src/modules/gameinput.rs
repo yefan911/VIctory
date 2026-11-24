@@ -27,6 +27,8 @@ pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
 pub const READING_NOT_FOUND: HRESULT = 0x838A_0003_u32 as i32;
 pub const REFERENCE_TOO_OLD: HRESULT = 0x838A_0004_u32 as i32;
 const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
+const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
+const IID_IUNKNOWN: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46];
 
 /// Input kinds (bits) our devices have.
 const KEYBOARD_KIND: u32 = 0x10;
@@ -664,9 +666,27 @@ fn hand(out: Out, reading: Option<&Ref>) -> HRESULT {
     }
 }
 
-extern "system" fn no_interface(_: *const c_void, _iid: *const c_void, out: Out) -> HRESULT {
-    tracing::warn!("input QueryInterface not implemented");
-    fail(out, E_NOINTERFACE)
+fn query_iunknown<T>(
+    this: *const T,
+    iid: *const [u8; 16],
+    out: Out,
+    retain: extern "system" fn(*const T) -> u32,
+) -> HRESULT {
+    if iid.is_null() || out.is_null() {
+        return fail(out, E_POINTER);
+    }
+    // SAFETY: the caller passes a readable IID, checked non-null above.
+    if unsafe { *iid } != IID_IUNKNOWN {
+        return fail(out, E_NOINTERFACE);
+    }
+    retain(this);
+    // SAFETY: checked non-null; the caller passes room for a pointer.
+    unsafe { out.write(this.cast()) };
+    S_OK
+}
+
+extern "system" fn query_interface(this: *const c_void, iid: *const [u8; 16], out: Out) -> HRESULT {
+    query_iunknown(this, iid, out, add_ref)
 }
 /// The input object and devices live as long as the process.
 extern "system" fn add_ref(_: *const c_void) -> u32 {
@@ -1005,7 +1025,7 @@ extern "system" fn enable_oem_device(
 extern "system" fn set_focus_policy(_: This, _policy: u32) {}
 
 static INPUT: Table<22> = Table([
-    no_interface as *const (),        // 0x00
+    query_interface as *const (),     // 0x00
     add_ref as *const (),             // 0x08 AddRef
     add_ref as *const (),             // 0x10 Release
     timestamp as *const (),           // 0x18
@@ -1070,7 +1090,7 @@ extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
 }
 
 static DEVICE: Table<21> = Table([
-    no_interface as *const (),        // 0x00
+    query_interface as *const (),     // 0x00
     add_ref as *const (),             // 0x08 AddRef
     add_ref as *const (),             // 0x10 Release
     device_info as *const (),         // 0x18
@@ -1096,6 +1116,13 @@ static DEVICE: Table<21> = Table([
 fn reading<'a>(this: *const Reading) -> &'a Reading {
     // SAFETY: a reading we handed out and the title still holds.
     unsafe { &*this }
+}
+extern "system" fn reading_query(
+    this: *const c_void,
+    iid: *const [u8; 16],
+    out: Out,
+) -> HRESULT {
+    query_iunknown(this.cast(), iid, out, reading_add_ref)
 }
 extern "system" fn reading_add_ref(this: *const Reading) -> u32 {
     reading(this).refs.fetch_add(1, Ordering::Relaxed) + 1
@@ -1162,7 +1189,7 @@ extern "system" fn nothing(_: *const c_void) -> usize {
 }
 
 static READING: Table<25> = Table([
-    no_interface as *const (),      // 0x00
+    reading_query as *const (),     // 0x00
     reading_add_ref as *const (),   // 0x08
     reading_release as *const (),   // 0x10
     input_kind as *const (),        // 0x18
@@ -1616,6 +1643,44 @@ mod tests {
             Some(Provenance::Hle)
         );
         assert_eq!(r.classify("GameInput.dll", &ImportSymbol::Ordinal(2)), None);
+    }
+
+    #[test]
+    fn query_interface_returns_iunknown_and_retains_the_reading() {
+        type Query = extern "system" fn(*const c_void, *const [u8; 16], Out) -> HRESULT;
+        let (hub, _) = fake();
+        let reading = Ref::new(Reading {
+            vtable: &READING,
+            refs: AtomicU32::new(1),
+            device: &hub.devices[FALLBACK],
+            sequence: 1,
+            timestamp: 0,
+            value: Value::Pad(PadState::default()),
+        });
+        let reading_ptr = reading.0.as_ptr().cast_const();
+        for object in [
+            std::ptr::from_ref(&hub.object).cast(),
+            std::ptr::from_ref(&hub.devices[FALLBACK]).cast(),
+            reading_ptr.cast(),
+        ] {
+            let query = slot::<Query, _>(object, 0);
+            let mut out = std::ptr::null();
+            assert_eq!(query(object, &IID_IUNKNOWN, &mut out), S_OK);
+            assert_eq!(out, object);
+            assert_eq!(query(object, &[0; 16], &mut out), E_NOINTERFACE);
+            assert!(out.is_null());
+            out = object;
+            assert_eq!(query(object, std::ptr::null(), &mut out), E_POINTER);
+            assert!(out.is_null());
+            assert_eq!(
+                query(object, &IID_IUNKNOWN, std::ptr::null_mut()),
+                E_POINTER
+            );
+        }
+        assert_eq!(reading.refs.load(Ordering::Relaxed), 2);
+        drop(reading);
+        let release = slot::<extern "system" fn(*const Reading) -> u32, _>(reading_ptr, 0x10);
+        assert_eq!(release(reading_ptr), 0);
     }
 
     #[test]
